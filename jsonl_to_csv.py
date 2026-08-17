@@ -10,9 +10,9 @@ import sys
 
 
 ALL_COLUMNS = [
-    "id", "format", "institution", "accession_number",
-    "title", "artist", "year", "medium", "dimensions",
-    "classification", "description", "raw_text", "image_path"
+    "id", "source_format", "extraction_method", "institution", "accession_number",
+    "title", "artist", "year_raw", "years", "medium", "dimensions",
+    "classification", "description", "image_path", "warnings"
 ]
 
 
@@ -27,7 +27,12 @@ def main(in_path, out_path):
                 r = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            row = {col: r.get(col, "") for col in ALL_COLUMNS}
+            row = {}
+            for col in ALL_COLUMNS:
+                val = r.get(col, "")
+                if isinstance(val, list):
+                    val = "; ".join(str(v) for v in val)
+                row[col] = val
             rows.append(row)
 
     with open(out_path, "w", newline="", encoding="utf-8-sig") as f:
