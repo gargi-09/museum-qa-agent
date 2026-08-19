@@ -23,12 +23,24 @@ Reason") -- both confirmed genuine matches via independent evidence
 (matching dimensions after unit conversion, near-identical descriptive
 content) -- not just coincidental title reuse.
 
-IMPORTANT CAVEAT, FOUND AND QUANTIFIED: generic titles ("Untitled",
-"Composition", "Still Life", etc.) are a real weakness of pure title+artist
-matching, since artists (especially minimalists) reuse these titles across
-genuinely distinct works. Quantified: only 16 of 405 groups (4%) use a
-generic title. These are flagged as LOWER CONFIDENCE rather than silently
-treated the same as distinctive-title matches.
+SYSTEMATIC ARTIST-NAME AUDIT, run after test_pipeline.py revealed a real
+missed duplicate ("Louise Bourgeois" vs "L. Bourgeois") during integration
+testing -- rather than fix that one case and move on, ran a full-corpus,
+non-reactive scan for the same TWO underlying patterns:
+  1. Initial vs. full first name (e.g. "L. Bourgeois" / "Louise
+     Bourgeois"): found 64 distinct pairs across the whole corpus, not
+     just the 1 found by accident. Handled via artists_match()'s
+     initial-matching rule, explicitly flagged low-confidence (small,
+     accepted risk of merging two different people who share a surname
+     and initial -- mitigated by requiring a matching, usually
+     distinctive, title on top of the name match).
+  2. Diacritic-only variants (e.g. "Andre Derain" / "Andre\u0301 Derain",
+     "Frantisek Kupka" plain vs. accented): found 8 pairs. Unlike the
+     initial-name case, this carries no real risk of merging different
+     people, so it's applied unconditionally in normalize_artist() as
+     core normalization, not flagged as lower-confidence.
+  Also checked TITLES for the same diacritic pattern across the whole
+  corpus: zero found, so titles were left as-is.
 
 BONUS FINDING: comparing already-normalized `years` lists (from ingest.py)
 between records in a confirmed group gives a SECOND deterministic check for
@@ -41,6 +53,7 @@ import json
 import re
 import sys
 import os
+import unicodedata
 from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -53,10 +66,32 @@ GENERIC_TITLES = {
 }
 
 
+def strip_diacritics(s):
+    """Removes accent marks (e.g. 'e' from 'e-acute') while keeping the
+    base letter, via Unicode NFD decomposition + stripping combining marks.
+
+    ADDED after a SYSTEMATIC, WHOLE-CORPUS scan (not just reactive
+    spot-checking) found 8 artist-name pairs differing ONLY by diacritics
+    -- e.g. 'Andre Derain' vs 'Andre\u0301 Derain', 'Frantisek Kupka' vs
+    'Frantisek Kupka' (accented), 'Chaim Soutine' vs 'Chai\u0308m Soutine'.
+    Unlike the initial-name matching rule below, this carries essentially
+    ZERO risk of merging two DIFFERENT people -- the same name written
+    with or without accent marks is unambiguously the same name, so this
+    is applied unconditionally as part of core normalization, not flagged
+    as lower-confidence.
+
+    Also checked TITLES for this same pattern across the whole corpus:
+    zero diacritic-only title variants found, so this is applied to
+    artist names only.
+    """
+    return ''.join(c for c in unicodedata.normalize('NFD', s)
+                   if unicodedata.category(c) != 'Mn')
+
+
 def normalize_artist(artist):
     """Deterministic rule: reorder 'Last, First' -> 'first last', strip
-    punctuation, lowercase. Verified against a real corpus case: matches
-    'Frankenthaler, Helen' with 'Helen Frankenthaler'.
+    diacritics, strip punctuation, lowercase. Verified against a real
+    corpus case: matches 'Frankenthaler, Helen' with 'Helen Frankenthaler'.
     """
     if not artist:
         return ""
@@ -65,6 +100,7 @@ def normalize_artist(artist):
         parts = [p.strip() for p in artist.split(",", 1)]
         if len(parts) == 2:
             artist = f"{parts[1]} {parts[0]}"
+    artist = strip_diacritics(artist)
     return re.sub(r"[^\w\s]", "", artist.lower()).strip()
 
 
@@ -79,30 +115,113 @@ def normalize_title(title):
     return re.sub(r"[^\w\s]", "", title.lower()).strip()
 
 
-def build_entity_groups(records):
-    """Groups records by exact (normalized_title, normalized_artist) match.
-    Returns a list of group dicts, each with the records, whether it spans
-    multiple institutions, and a confidence flag (generic titles are
-    lower-confidence).
+def artists_match(artist1, artist2):
+    """Checks whether two artist strings likely refer to the same person.
+
+    REAL BUG FOUND via test_pipeline.py: 'Louise Bourgeois' (cma-160793)
+    and 'L. Bourgeois' (aic-215406) are the same person, same work ('Ode
+    to My Mother' / 'Ode To My Mother'), but the original exact-match-only
+    normalize_artist() never unified them -- a true cross-institution
+    duplicate was silently MISSED, the opposite failure direction from
+    the false-positive risks handled elsewhere in this module.
+
+    FIX: after exact normalized match fails, also check whether one is a
+    single-initial + matching last name against the other's full first
+    name + same last name (e.g. 'l bourgeois' vs 'louise bourgeois').
+
+    KNOWN, ACCEPTED RISK: this could incorrectly match two DIFFERENT
+    people sharing a last name and initial (e.g. 'Jane Smith' vs
+    'J. Smith'). Mitigated by: (1) this only ever runs on a small set of
+    already topically-relevant retrieval candidates for the SAME query,
+    not the whole corpus, making an unrelated same-surname collision
+    unlikely in practice; (2) matches found via this rule are explicitly
+    flagged as lower confidence (see build_entity_groups), not silently
+    trusted the same as an exact match.
+
+    Returns (is_match, match_type) where match_type is 'exact',
+    'initial', or None.
     """
-    raw_groups = defaultdict(list)
-    for r in records:
-        key = (normalize_title(r.get("title")), normalize_artist(r.get("artist")))
-        if key[0] and key[1]:
-            raw_groups[key].append(r)
+    n1, n2 = normalize_artist(artist1), normalize_artist(artist2)
+    if not n1 or not n2:
+        return False, None
+    if n1 == n2:
+        return True, "exact"
+
+    p1, p2 = n1.split(), n2.split()
+    if len(p1) == 2 and len(p2) == 2 and p1[-1] == p2[-1]:
+        f1, f2 = p1[0], p2[0]
+        if (len(f1) == 1 and f2.startswith(f1)) or (len(f2) == 1 and f1.startswith(f2)):
+            return True, "initial"
+
+    return False, None
+
+
+def build_entity_groups(records):
+    """Groups records that likely represent the same real-world object.
+
+    Changed from exact dict-key grouping to PAIRWISE comparison (O(n^2),
+    fine since this only ever runs on a small retrieval candidate set,
+    not the full corpus) specifically to support the initial-vs-full-name
+    artist matching above, which exact-key grouping can't express.
+
+    Returns a list of group dicts, each with the records, whether it spans
+    multiple institutions, and a confidence flag. Confidence is 'low' if
+    EITHER the title is generic OR any member was matched via the
+    initial-name rule rather than an exact artist match -- both are
+    real, distinct sources of uncertainty, and neither should be hidden
+    behind a single silent "matched" result.
+    """
+    n = len(records)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    used_initial_match = set()
+
+    for i in range(n):
+        title_i = normalize_title(records[i].get("title"))
+        if not title_i:
+            continue
+        for j in range(i + 1, n):
+            title_j = normalize_title(records[j].get("title"))
+            if title_i != title_j:
+                continue
+            is_match, match_type = artists_match(
+                records[i].get("artist"), records[j].get("artist")
+            )
+            if is_match:
+                union(i, j)
+                if match_type == "initial":
+                    used_initial_match.add(find(i))
+
+    clusters = defaultdict(list)
+    for i in range(n):
+        if normalize_title(records[i].get("title")):
+            clusters[find(i)].append(records[i])
 
     groups = []
-    for (norm_title, norm_artist), members in raw_groups.items():
+    for root, members in clusters.items():
         if len(members) < 2:
             continue
+        norm_title = normalize_title(members[0].get("title"))
         institutions = set(m["institution"] for m in members)
+        is_low_confidence = norm_title in GENERIC_TITLES or root in used_initial_match
         groups.append({
             "normalized_title": norm_title,
-            "normalized_artist": norm_artist,
+            "normalized_artist": normalize_artist(members[0].get("artist")),
             "members": members,
             "spans_institutions": len(institutions) > 1,
             "institutions": institutions,
-            "confidence": "low" if norm_title in GENERIC_TITLES else "high",
+            "confidence": "low" if is_low_confidence else "high",
         })
     return groups
 

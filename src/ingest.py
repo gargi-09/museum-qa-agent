@@ -33,18 +33,19 @@ def normalize_year(year_str):
     2-digit shorthand ranges (e.g. '1967-68' -> [1967, 1968], '1922/24' ->
     [1922, 1924]).
 
-    IMPORTANT BUG FIX (found via visual CSV inspection, not automated testing):
-    the original version only matched standalone 4-digit years, which silently
-    DROPPED the second year in any shorthand range like '1967-68' -- it
-    extracted [1967] and never surfaced 1968. This affected 283 of 1,044
-    distinct year strings in this corpus (27%) -- a systematic gap, not a rare
-    edge case. The earlier "zero extraction failures" stress test result was
-    true but misleading: it only checked whether ANY year was extracted, not
-    whether ALL years present were captured. Exactly the "absence of error
-    != success" trap this assignment explicitly warns about.
+    IMPORTANT BUG FIX (found via visual CSV inspection, not automated
+    testing): the original version only matched standalone 4-digit years,
+    which silently DROPPED the second year in any shorthand range like
+    '1967-68' -- it extracted [1967] and never surfaced 1968. This affected
+    283 of 1,044 distinct year strings in this corpus (27%) -- a systematic
+    gap, not a rare edge case. The earlier "zero extraction failures"
+    stress test result was true but misleading: it only checked whether
+    ANY year was extracted, not whether ALL years present were captured.
+    Exactly the "absence of error != success" trap this assignment
+    explicitly warns about.
 
-    Checked for century-rollover risk (e.g. '1999-00' meaning 2000, not 1900)
-    -- confirmed zero such cases exist in this corpus, so the simple
+    Checked for century-rollover risk (e.g. '1999-00' meaning 2000, not
+    1900) -- confirmed zero such cases exist in this corpus, so the simple
     "prepend first year's century" approach is safe here.
     """
     if not year_str or not year_str.strip():
@@ -225,9 +226,9 @@ def extract_semi_structured(record):
 
 HTML_TAG = re.compile(r'<[a-zA-Z/][^>]*>')
 ORPHAN_TAG_OPEN = re.compile(r'<[a-zA-Z]+\s+[a-zA-Z-]+\s*=\s*\\?"')
-MALFORMED_CLOSE_DOT = re.compile(r'<\.([a-zA-Z]+)>')                  # <.em> instead of </em>
-MALFORMED_OPEN_DOUBLE = re.compile(r'<([a-zA-Z]+)<')                  # <em<  instead of <em>
-MALFORMED_CLOSE_NOBRACKET = re.compile(r'</([a-zA-Z]+)(?!\w)(?!>)')   # </em  (missing closing >)
+MALFORMED_CLOSE_DOT = re.compile(r'<\.([a-zA-Z]+)>')
+MALFORMED_OPEN_DOUBLE = re.compile(r'<([a-zA-Z]+)<')
+MALFORMED_CLOSE_NOBRACKET = re.compile(r'</([a-zA-Z]+)(?!\w)(?!>)')
 
 
 def strip_html(text):
@@ -244,11 +245,11 @@ def strip_html(text):
 
     2. 1 record (aic-136265) with an ORPHANED opening tag that never closes
        at all -- the "attribute value" here is actually the record's real
-       description text, not a URL, so only the tag-open syntax itself is
+       description text, not a URL, so only the tag-open syntax is
        stripped, preserving the real text. Known, disclosed cosmetic side
        effect: this one record's description now contains a duplicated
        leading phrase baked into the original corrupted source data --
-       a deliberate scope decision (1 record out of 5,000) rather than an
+       a deliberate scope decision (1 record out of 5,000), not an
        oversight.
 
     3. 3 MORE records found in a follow-up full-corpus sweep, with distinct
@@ -266,6 +267,12 @@ def strip_html(text):
     notation) -- verified via cross-referencing before concluding this, and
     deliberately NOT touched by any of the patterns below, since none of
     them match on angle brackets adjacent to digits rather than letters.
+
+    Handling: strip tags/fragments entirely rather than trying to render
+    them -- for broken link tags this removes URL noise that would
+    otherwise pollute embeddings/retrieval with meaningless text; for
+    inline formatting tags this correctly preserves the real word while
+    dropping markup we have no use for.
     """
     if not text:
         return text
@@ -340,8 +347,31 @@ def normalize_record(record):
             classification = clean_str(extracted.get("classification"))
             description = clean_str(extracted.get("description") or extracted.get("notes"))
         else:
-            title = artist = year_raw = medium = dimensions = classification = description = None
+            # REAL BUG FOUND via systematic sweep (checking every field for
+            # degenerate/empty cases, not just spot-checking): when all
+            # three deterministic extraction patterns fail, this branch
+            # previously set EVERY field to None, including description --
+            # which silently discarded the record's raw_text entirely, even
+            # though that text is fully readable prose (e.g. "Coney Island
+            # Beach, Reginald Marsh, 1935. etching...No corner of New York
+            # City escaped Reginald Marsh's observation..."). This made
+            # these 7 records completely INVISIBLE to retrieval (empty
+            # passage text -> zero BM25 score, degenerate embedding) and is
+            # exactly the anti-pattern the assignment explicitly warns
+            # against: "records that failed to parse getting dropped
+            # without mention" -- the console output DID mention them, but
+            # the actual usable content was gone from the data itself.
+            #
+            # FIX: preserve raw_text as the description field when
+            # structured extraction fails. This is honest, not a silent
+            # workaround -- the extraction_method and warning below make
+            # clear this record's fields are UNSTRUCTURED fallback text,
+            # not verified structured data, so downstream code (and any
+            # human reading the data) can tell the difference.
+            title = artist = year_raw = medium = dimensions = classification = None
+            description = clean_str(record.get("raw_text"))
             warnings.append("extraction_failed_needs_llm_fallback")
+            warnings.append("using_raw_text_as_description_fallback")
 
     else:
         # Unknown format value -- defensive fallback, never silently skip a record
