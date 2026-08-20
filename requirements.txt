@@ -1,0 +1,21 @@
+# Direct dependencies, pinned to the versions this was actually developed and
+# tested against. Transitive dependencies (torch, transformers, scikit-learn,
+# scipy, huggingface-hub, tokenizers, ...) are pulled in by
+# sentence-transformers and are deliberately not pinned here -- see
+# requirements-lock.txt for the exact full environment.
+#
+#     pip install -r requirements.txt
+#
+# NOTE on cost, per the brief §5: the two retrieval dependencies below
+# (rank-bm25, sentence-transformers) are what make the first pass of the
+# funnel free -- text embeddings do not count against the 200,000-token
+# budget. Nothing here calls the model; that is requests only.
+
+# --- Model endpoint -------------------------------------------------------
+requests==2.34.2
+python-dotenv==1.2.3
+
+# --- Retrieval (free: embeddings are not billed) --------------------------
+numpy==2.5.2
+rank-bm25==0.2.2
+sentence-transformers==5.7.0

@@ -81,7 +81,7 @@ def main():
     # First, run retrieval ONCE to find real candidate IDs to use in our
     # fake scenarios below (so the fabricated-citation test uses a REAL
     # record ID that just wasn't retrieved, not a nonsense string).
-    candidates, abstain, best_sim = retriever.retrieve(question, top_k=10)
+    candidates, abstain, best_sim, signals = retriever.retrieve(question, top_k=10)
     real_candidate_ids = [c["id"] for c in candidates]
     print(f"Real candidates retrieved for this question: {real_candidate_ids}\n")
 

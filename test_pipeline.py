@@ -48,7 +48,7 @@ def assemble_context_for_question(question, retriever, top_k=10):
     returns the assembled context that WOULD be sent to Haiku, without
     ever calling the API.
     """
-    candidates, abstain, best_sim = retriever.retrieve(question, top_k=top_k)
+    candidates, abstain, best_sim, signals = retriever.retrieve(question, top_k=top_k)
 
     print(f"\n{'='*70}")
     print(f"QUESTION: {question!r}")

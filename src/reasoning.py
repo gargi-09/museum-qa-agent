@@ -12,6 +12,21 @@ api_client.call_haiku() checks credentials first and returns a clean
 'missing_credentials' error rather than crashing, so everything up to
 the actual network call (context assembly, prompt construction, output
 parsing, verification logic) can be built and verified today.
+
+SCOPE DECISION: vision is NOT used, despite 1,788 of 5,000 records
+(35.8%) carrying an image_path the assignment doc explicitly makes
+available. This is a deliberate choice, not an oversight: the text
+fields (description, title, artist, medium) are complete enough for
+every question in the demo set to be answered from text alone, and
+image content would add real token cost (vision tokens count against
+the same 200k budget per the assignment doc) for a capability not yet
+shown to be needed. If a future question genuinely required visual
+information text doesn't capture (e.g. "which of these prints uses a
+red color palette"), the natural extension point is here: fetch the
+image via {CORTEX_DATA_BASE}/images/{image_path}, pass it as a vision
+content part to Haiku alongside the text context already assembled.
+Not built now because it was never demonstrated to be necessary, and
+building it speculatively would spend budget on an unproven need.
 """
 import json
 import os
@@ -30,15 +45,51 @@ from memory import apply_corrections_to_record, load_corrections
 # Context assembly
 # ---------------------------------------------------------------------------
 
+# Field label shown in the prompt -> the record key it reads from. Ordered:
+# this is the order fields appear in the prompt, and dicts preserve it.
+#
+# 'year' reads from 'year_raw' deliberately -- the human-written string
+# ("c. 1926", "1967-68") is what should be shown, while the parsed 'years'
+# list stays internal for check_factual_match to compare against.
+PROMPT_FIELDS = {
+    "title": "title",
+    "artist": "artist",
+    "year": "year_raw",
+    "medium": "medium",
+    "dimensions": "dimensions",
+    "classification": "classification",
+}
+
+
 def build_not_recorded_view(record):
     """Converts internal None values into the explicit '[not recorded]'
     marker for anything shown in a prompt. This is deliberately a
     PROMPT-TIME concern, not baked into ingest.py's data storage --
     internal code keeps using None/truthiness checks; only text actually
     shown to Haiku uses this marker.
+
+    REAL BUG, found on the first live dev call: 'year' was MISSING from this
+    list entirely. The context block carried a 'years' key and
+    format_context_blocks_for_prompt() rendered exactly this dict plus the
+    description, so no record's year was ever written into the prompt at all.
+    The parsed year was used only for post-hoc verification. Asked "what year
+    was Coney Island Beach made?", the model answered "the corpus does not
+    record the year" and set answerable=false -- which was the CORRECT reading
+    of a prompt that genuinely did not contain it, for a record whose
+    year_raw is '1935'.
+
+    WHAT MAKES THIS THE WORST KIND OF BUG HERE: every verification check
+    passed and confidence came back 0.88/high. check_not_recorded_violation
+    compares the answer against the fields it was SHOWN, and factual_match
+    reported "no year mentioned in answer -- nothing to check". Neither can
+    detect a field that never made it into the prompt, because both validate
+    answer-vs-context consistency, not context completeness. A missing input
+    field is invisible to output verification -- which is exactly why the
+    demo run mattered and why offline prompt inspection alone would not have
+    caught it either.
     """
-    fields = ["title", "artist", "medium", "dimensions", "classification"]
-    return {f: (record.get(f) if record.get(f) else "[not recorded]") for f in fields}
+    return {shown: (record.get(src) if record.get(src) else "[not recorded]")
+            for shown, src in PROMPT_FIELDS.items()}
 
 
 def assemble_context_blocks(candidates):
@@ -205,8 +256,18 @@ def format_context_blocks_for_prompt(context_blocks):
     for block in context_blocks:
         lines.append(f"--- RECORD {block['id']} ({block['institution']}, "
                       f"accession {block['accession_number'] or '[not recorded]'}) ---")
+        # Renders whatever build_not_recorded_view() returns, which is why
+        # adding 'year' to PROMPT_FIELDS is sufficient to surface it here --
+        # and why omitting it there silently removed it from every prompt.
         for field, value in block["fields"].items():
             lines.append(f"{field}: {value}")
+        # The parsed year list is normally redundant with the year string above,
+        # so emit it ONLY when it expands to more than one year (year_raw
+        # "1967-68" -> [1967, 1968]). In that case the model should read the
+        # same range that check_factual_match will validate its answer against,
+        # rather than having to infer the expansion itself.
+        if len(block.get("years") or []) > 1:
+            lines.append(f"year (parsed): {block['years']}")
         lines.append(f"description: {block['description']}")
         if block["group_note"]:
             lines.append(f"NOTE: {block['group_note']}")
@@ -251,13 +312,48 @@ Respond ONLY with valid JSON in this exact format, nothing else before or after:
 }"""
 
 
+# The rules above, wrapped in an explicit delimiter.
+#
+# WHY THE TAGS EXIST: measurement showed the Cortex proxy DISCARDS the system
+# prompt however it is passed separately -- prompt_tokens did not move for a
+# top-level 'system' key, nor for a {"role": "system"} entry in messages, and
+# the model returned an identical generic greeting in both cases. The only
+# placement that provably survives is inside the user message itself
+# (CORTEX_MESSAGE_FORMAT=prepend, see api_client._prepend_system).
+#
+# That creates a problem the tags solve: once these rules sit in the same
+# message as the question and 5,000-ish characters of retrieved records, the
+# model has no structural cue separating standing instructions from user
+# content. An explicit <instructions> block restores that boundary, and
+# Claude follows XML-delimited sections reliably.
+#
+# The tags live HERE, not in api_client, on purpose. Where the text goes on
+# the wire is a network concern and belongs to build_payload(); how the prompt
+# is worded and demarcated is prompt engineering and belongs to this module.
+# Harmless in the other placements too -- a tagged system prompt is still a
+# perfectly good system prompt -- so this does not have to change if the
+# endpoint's behaviour ever does.
+INSTRUCTIONS_BLOCK = f"<instructions>\n{SYSTEM_PROMPT}\n</instructions>"
+
+
 def build_prompt(question, context_blocks):
+    """Returns (instructions, messages) -- deliberately provider-NEUTRAL.
+
+    messages contains ONLY 'user'/'assistant' turns. The instructions come
+    back SEPARATELY rather than as a {"role": "system"} entry, because the
+    three candidate placements disagree about where they belong (Anthropic:
+    top-level 'system'; OpenAI: first messages entry; prepend: folded into
+    the user message). Committing to one here would bake a wire-format
+    decision into the reasoning layer.
+
+    api_client.build_payload() owns that translation, consistent with this
+    pipeline's rule that every network concern lives in exactly one file.
+    What this module owns is the CONTENT -- the rules themselves and the
+    <instructions> delimiter around them.
+    """
     context_text = format_context_blocks_for_prompt(context_blocks)
     user_message = f"QUESTION: {question}\n\nRETRIEVED RECORDS:\n\n{context_text}"
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user_message},
-    ]
+    return INSTRUCTIONS_BLOCK, [{"role": "user", "content": user_message}]
 
 
 # ---------------------------------------------------------------------------
@@ -443,11 +539,23 @@ def compute_confidence(best_similarity, verification_passed, verification_total,
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def answer_question(question, retriever, dev_mode=False, top_k=10):
+ANSWER_MAX_TOKENS = 1024
+
+
+def answer_question(question, retriever, dev_mode=False, top_k=10,
+                     max_tokens=ANSWER_MAX_TOKENS):
     """The full pipeline for one question. Ties together every module
     built so far. Buildable/testable end-to-end right now -- if
     credentials are missing, call_haiku() returns cleanly and this
     function reports that clearly rather than crashing.
+
+    max_tokens=1024 matches the brief's own client example. Previously 600,
+    which was too tight for the required output: the response has to carry
+    answer + limitations + one {id, reason} object per retrieved-but-unused
+    record, and with top_k=10 that can plausibly exceed 600 tokens. A
+    genuine cap-truncation there is not free -- detect_truncation() flags it
+    and call_haiku() spends a WHOLE EXTRA CALL retrying, so an over-tight
+    cap costs more budget than the larger cap it was trying to save.
 
     top_k=10 is EXPLICIT here, matching what was actually validated via
     test_pipeline.py's manual testing (entity groupings, context block
@@ -461,28 +569,37 @@ def answer_question(question, retriever, dev_mode=False, top_k=10):
     Making this explicit here, rather than relying on retrieval.py's
     internal default, prevents this kind of silent drift.
     """
-    candidates, abstain, best_sim = retriever.retrieve(question, top_k=top_k)
+    candidates, abstain, best_sim, signals = retriever.retrieve(question, top_k=top_k)
 
     if abstain:
+        # Report the signal that ACTUALLY fired. The old message always blamed
+        # dense similarity, which would now be wrong whenever the BM25 floor is
+        # what stopped the call -- and BM25 is the trigger for exactly the junk
+        # questions the dense check was letting through.
         return {
             "question": question,
             "abstained": True,
-            "reason": f"Best retrieval similarity ({best_sim:.3f}) below threshold -- "
-                      f"corpus likely doesn't contain a confident answer.",
+            "reason": "Abstained before any paid call: " + "; ".join(signals["abstain_reasons"]),
+            "retrieval_signals": signals,
             "answer": None,
         }
 
     context_blocks, folded_ids_map = assemble_context_blocks(candidates)
-    messages = build_prompt(question, context_blocks)
+    system_prompt, messages = build_prompt(question, context_blocks)
 
-    haiku_result = call_haiku(messages, max_tokens=600, dev_mode=dev_mode,
-                               stage="reasoning", expect_json=True)
+    haiku_result = call_haiku(messages, system=system_prompt, max_tokens=max_tokens,
+                               dev_mode=dev_mode, stage="reasoning", expect_json=True)
 
     if haiku_result["error_type"]:
         return {
             "question": question,
             "abstained": False,
             "error": haiku_result["error_type"],
+            # The server's own error text, when there was one. On a 4xx this
+            # names the offending field, which is what distinguishes a wrong
+            # CORTEX_MODEL from a wrong CORTEX_MESSAGE_FORMAT -- worth
+            # surfacing all the way up rather than only printing it.
+            "error_detail": haiku_result.get("error_detail"),
             "answer": None,
             "context_blocks_prepared": len(context_blocks),
         }
@@ -527,18 +644,37 @@ def answer_question(question, retriever, dev_mode=False, top_k=10):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 3:
-        print('Usage: python reasoning.py <normalized.jsonl> "<question>"')
+    # dev_mode is now an EXPLICIT flag rather than hardcoded True, which it was
+    # until now. The brief, §5: "While you're building, send the header
+    # X-Cortex-Mode: dev... Drop the header for the run you submit. We log
+    # both." With dev_mode hardcoded on, every run of this file -- including
+    # one used to produce the submitted demo transcript -- drew on the 50k
+    # sandbox instead of the real budget. Since Cortex logs both, that would
+    # have been visible on their side as a submission run that never really
+    # ran. Defaults to OFF so the honest thing happens unless --dev is asked
+    # for explicitly.
+    args = [a for a in sys.argv[1:] if a != "--dev"]
+    dev = "--dev" in sys.argv
+
+    if len(args) < 2:
+        print('Usage: python reasoning.py [--dev] <normalized.jsonl> "<question>"')
+        print()
+        print('  --dev   send X-Cortex-Mode: dev, drawing on the free 50,000-token')
+        print('          sandbox instead of the 200,000-token submission budget.')
+        print('          Use this while building. OMIT it for the submitted run.')
         sys.exit(0)
 
-    filepath = sys.argv[1]
-    question = sys.argv[2]
+    filepath, question = args[0], args[1]
 
     records = load_records(filepath)
     print(f"Loaded {len(records)} records")
     retriever = HybridRetriever(records)
 
-    result = answer_question(question, retriever, dev_mode=True)
+    print(f"[reasoning] dev_mode={dev} -- "
+          + ("free 50k sandbox (X-Cortex-Mode: dev)" if dev
+             else "REAL 200k submission budget, no dev header"))
+
+    result = answer_question(question, retriever, dev_mode=dev)
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
     print("\n" + get_tracker().summary())

@@ -15,6 +15,7 @@ shape, regardless of source format, ready for the retrieval layer.
 Usage: python src/ingest.py data/base.jsonl data/normalized.jsonl
 """
 import json
+import os
 import re
 import sys
 from collections import Counter
@@ -177,21 +178,285 @@ def try_newline_extraction(raw_text, accession_number):
     }
 
 
-def extract_via_llm_fallback(record):
-    """Extension point for the ~1.8% of semi_structured records where none of
-    the three deterministic patterns match (verified root cause: a genuinely
-    blank accession_number in the source data, which correctly breaks the
-    anchor-based split rather than guessing).
+# Words that mean the comma-split landed on a publication verb rather than a
+# person -- e.g. "..., Mary Reynolds, Published 1930; rebound 1930-1950" splits
+# to artist="Published". Better to reject and fall through to the LLM fallback
+# than to write a confidently wrong artist into the corpus.
+NOT_AN_ARTIST = {
+    "published", "printed", "rebound", "made", "created", "dated", "executed",
+    "designed", "cast", "issued", "reprinted", "bound", "completed",
+}
 
-    NOT executed in this module -- this module has no network dependency by
-    design, so ingestion can be tested and re-run freely without touching the
-    token budget. Wire this up to api_client.py (Haiku call) as a one-time
-    ingestion-stage cost when the API layer exists.
 
-    Returns None here; the calling code flags these records as
-    'needs_llm_fallback' so they're clearly visible, not silently dropped.
+def try_year_anchored_extraction(raw_text):
+    """Pattern D: same two shapes as patterns B and C, but anchored on the YEAR
+    instead of the accession number.
+
+    WHY THIS EXISTS. Patterns B and C both open with `if not accession_number:
+    return None`, and both use the accession as the split anchor. Measured
+    root cause of every extraction failure in this corpus: all 7 records that
+    fall through have accession_number == '' (empty string, not missing), so
+    both patterns bail before looking at text they could actually parse. The
+    accession was never load-bearing for finding title/artist -- pattern B
+    already locates the year by regex and splits around THAT -- so anchoring on
+    the year removes the dependency entirely.
+
+    WHY IT MATTERS BEYOND TIDINESS. Those 7 records had title, artist, medium
+    and classification all None, which left their retrieval passage as raw
+    prose. Measured consequence: BM25 ranked each one #1 of 5,000 for a query
+    drawn from its own text, while the dense encoder ranked them 3,952-4,971
+    of 5,000, so Reciprocal Rank Fusion buried all 7 outside the top 10 and
+    they were effectively unreachable. Populating the structured fields fixes
+    the retrieval failure as a side effect, because the passage then starts
+    with distinctive title/artist text like every healthy record.
+
+    Returns (extracted_dict_or_None, note). Rejects rather than guesses when
+    the split looks wrong -- see NOT_AN_ARTIST.
     """
-    return None
+    if not raw_text or not raw_text.strip():
+        return None, "empty raw_text"
+
+    # --- shape 1: newline-delimited, "Artist\nTitle (Year)\nMedium\nInst, acc." ---
+    split = re.split(r"\n\s*\n", raw_text, maxsplit=1)
+    if len(split) == 2:
+        meta_lines = [l.strip() for l in split[0].split("\n") if l.strip()]
+        if len(meta_lines) >= 3:
+            artist = meta_lines[0]
+            title_year = meta_lines[1]
+            ym = re.search(r"\(([^)]*\d{3,4}[^)]*)\)\s*$", title_year)
+            year = ym.group(1).strip() if ym else None
+            title = (title_year[:ym.start()].strip().rstrip(",")
+                     if ym else title_year)
+            # Drop the "Institution, acc. NNN" line from the medium text.
+            medium_lines = [l for l in meta_lines[2:]
+                            if not re.search(r",\s*acc\.", l)]
+            if title and artist:
+                return {
+                    "artist": artist,
+                    "title": title,
+                    "year": year,
+                    "medium_and_dimensions": " ".join(medium_lines).strip(),
+                    "description": split[1].strip(),
+                }, "pattern_d_newline_year_anchored"
+
+    # --- shape 2: "Title, Artist, Year. medium. dims. Accession . description" ---
+    year_match = YEAR_TOKEN.search(raw_text)
+    if not year_match:
+        return None, "no year token found"
+
+    before = raw_text[:year_match.start()].rstrip(", ")
+    year = year_match.group().strip()
+    remainder = raw_text[year_match.end():]
+
+    if "," not in before:
+        return None, "no comma before the year to split title/artist on"
+
+    # Split on the LAST comma before the year: robust to titles that themselves
+    # contain commas, which is the same reasoning pattern B uses.
+    title, artist = before.rsplit(",", 1)
+    title, artist = title.strip(), artist.strip()
+
+    if not title:
+        return None, "empty title after split"
+    if not artist:
+        return None, "empty artist after split"
+    if artist.lower().strip(".") in NOT_AN_ARTIST:
+        # The comma-split landed on a publication verb, so this record's title
+        # runs past where we think it does. Refuse rather than record a wrong
+        # artist -- this is the one shape pattern D deliberately does not force.
+        return None, f"rejected: artist={artist!r} is a publication verb, not a name"
+
+    # "Accession" is the description boundary when present. It is only a
+    # BOUNDARY here, never an anchor -- absent or blank, we still parsed the
+    # title, artist and year above.
+    acc = re.search(r"\bAccession\b", remainder)
+    if acc:
+        medium_and_dims = remainder[:acc.start()].strip(" .;")
+        description = remainder[acc.end():].lstrip(" .;")
+    else:
+        medium_and_dims = None
+        description = remainder.strip(" .;")
+
+    return {
+        "title": title,
+        "artist": artist,
+        "year": year,
+        "medium_and_dimensions": medium_and_dims or None,
+        "description": description or None,
+    }, "pattern_d_comma_year_anchored"
+
+
+# ---------------------------------------------------------------------------
+# LLM fallback -- the ONLY thing in this module that can cost tokens
+# ---------------------------------------------------------------------------
+#
+# OFF BY DEFAULT, deliberately. This module's original design property was that
+# ingestion has no network dependency, so it can be re-run freely while
+# iterating without touching the budget. That property is worth keeping: with
+# the flag off, `python src/main.py ingest` is still free and unlimited. Only
+# an explicit opt-in spends anything.
+ENABLE_LLM_FALLBACK = os.getenv("CORTEX_INGEST_LLM_FALLBACK", "0") != "0"
+
+# Dev sandbox by default when the fallback IS enabled, so an accidental
+# enable costs the free 50k rather than the 200k submission budget.
+LLM_FALLBACK_DEV_MODE = os.getenv("CORTEX_INGEST_LLM_DEV", "1") != "0"
+
+# Output is four short fields. 400 leaves headroom for a long title without
+# inviting the model to pad -- aic-244616's title alone runs ~150 chars.
+LLM_FALLBACK_MAX_TOKENS = 400
+
+FALLBACK_INSTRUCTIONS = """You extract catalog metadata from the raw text of a single museum record.
+
+Respond ONLY with valid JSON in exactly this shape, nothing before or after:
+{
+  "title": "the artwork's title, or null",
+  "artist": "the artist's or maker's name, or null",
+  "year": "the date exactly as written in the text, or null",
+  "medium": "the medium and dimensions as written, or null"
+}
+
+RULES:
+
+1. COPY VERBATIM. Take values word-for-word from the raw text. Do not normalise dates, translate titles, expand abbreviations, or tidy punctuation.
+
+2. NEVER INFER FROM OUTSIDE KNOWLEDGE. If the text does not state a field, use null. Do not fill it in from what you know about art history, even if you recognise the work or the artist. A null is correct and useful; a plausible guess is not.
+
+3. TITLES CAN CONTAIN COMMAS AND PARENTHESES. The title may run for a long way and may include its own translation in brackets. Include the whole thing, and do not mistake a comma inside the title for the boundary between title and artist.
+
+4. THE ARTIST IS A PERSON OR MAKER, never a verb or a publishing action. If the only candidate is a word like "Published", "Printed" or "Rebound", the artist is null."""
+
+
+def _parse_fallback_json(raw_content):
+    """Defensive JSON parse for the fallback response.
+
+    Same shape of defence as reasoning.py's parse_haiku_response -- tolerate
+    markdown fences and stray prose around the JSON rather than assuming the
+    model followed instructions exactly. Deliberately DUPLICATED rather than
+    imported: reasoning.py already imports normalize_year from this module, so
+    importing it back would create a circular import. The duplication is small
+    and the cycle would not be.
+
+    Returns (parsed_dict_or_None, error_or_None).
+    """
+    if not raw_content:
+        return None, "empty_response"
+
+    text = raw_content.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[A-Za-z0-9_+-]*[ \t]*\r?\n?", "", text, count=1)
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+        text = text.strip()
+
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1 or end < start:
+        return None, "no_json_found"
+
+    try:
+        parsed = json.loads(text[start:end + 1])
+    except json.JSONDecodeError as e:
+        return None, f"json_decode_error: {e}"
+    if not isinstance(parsed, dict):
+        return None, f"expected an object, got {type(parsed).__name__}"
+    return parsed, None
+
+
+def extract_via_llm_fallback(record, dev_mode=None):
+    """Last resort for records no deterministic pattern can parse.
+
+    After pattern D, exactly ONE record in this 5,000-record corpus reaches
+    here: aic-244616, whose title contains commas AND whose year reads
+    "Published 1930; rebound 1930-1950", so the last-comma-before-the-year
+    split lands on "Published" instead of a name. Pattern D detects that and
+    refuses rather than recording a wrong artist -- which is exactly the case
+    a model handles better than a regex, because the boundary needs reading
+    comprehension rather than a delimiter.
+
+    Costs ONE Haiku call, and only when ENABLE_LLM_FALLBACK is set. Returns a
+    dict in the same shape the deterministic patterns return, so it flows
+    through normalize_record()'s existing field-population path with no
+    special-casing downstream.
+
+    Returns None on any failure -- disabled, network error, unparseable
+    output, or output that fails the plausibility checks below. The caller
+    then flags the record as needing fallback, so a failure here is visible
+    rather than silently producing a half-populated record.
+    """
+    if not ENABLE_LLM_FALLBACK:
+        return None
+
+    raw_text = record.get("raw_text") or ""
+    if not raw_text.strip():
+        return None
+
+    # Imported lazily so this module stays importable, testable and re-runnable
+    # with no network dependency whenever the flag is off.
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from api_client import call_haiku
+
+    dev = LLM_FALLBACK_DEV_MODE if dev_mode is None else dev_mode
+    rid = record.get("id")
+    print(f"[ingest] LLM fallback: calling Haiku for {rid} "
+          f"(dev_mode={dev}, {len(raw_text)} chars of raw text)")
+
+    result = call_haiku(
+        [{"role": "user", "content": f"RAW RECORD TEXT:\n\n{raw_text}"}],
+        system=FALLBACK_INSTRUCTIONS,
+        max_tokens=LLM_FALLBACK_MAX_TOKENS,
+        dev_mode=dev,
+        stage="ingest_llm_fallback",
+        expect_json=True,
+    )
+
+    if result["error_type"]:
+        print(f"[ingest] LLM fallback FAILED for {rid}: {result['error_type']}"
+              + (f" -- {result.get('error_detail')}" if result.get("error_detail") else ""))
+        return None
+
+    parsed, err = _parse_fallback_json(result["content"])
+    if parsed is None:
+        print(f"[ingest] LLM fallback output unparseable for {rid}: {err}")
+        print(f"[ingest]   raw content: {result['content']!r}")
+        return None
+
+    title = (parsed.get("title") or None)
+    artist = (parsed.get("artist") or None)
+    year = (parsed.get("year") or None)
+    medium = (parsed.get("medium") or None)
+
+    # Plausibility gate. The model is not trusted more than the regex was --
+    # it is trusted DIFFERENTLY. These are the same checks pattern D applies,
+    # because the failure modes are the same shape.
+    if not title and not artist:
+        print(f"[ingest] LLM fallback for {rid} produced neither title nor "
+              f"artist -- rejecting.")
+        return None
+    if artist and str(artist).lower().strip(". ") in NOT_AN_ARTIST:
+        print(f"[ingest] LLM fallback for {rid} returned artist={artist!r}, "
+              f"a publication verb -- rejecting, same as pattern D would.")
+        return None
+    # Anti-hallucination check that costs nothing: anything the model claims to
+    # have copied verbatim must actually be present in the source text.
+    for label, value in (("title", title), ("artist", artist), ("year", year)):
+        if value and str(value) not in raw_text:
+            print(f"[ingest] LLM fallback for {rid}: {label}={value!r} does NOT "
+                  f"appear verbatim in the raw text -- rejecting as possibly "
+                  f"inferred rather than extracted.")
+            return None
+
+    print(f"[ingest] LLM fallback OK for {rid}: title={title!r} artist={artist!r} "
+          f"year={year!r}")
+
+    # description stays as the raw text, matching what the non-LLM fallback
+    # path already does. Deliberately NOT asked of the model: it would mean
+    # paying for ~350 tokens of prose to be echoed back unchanged.
+    return {
+        "title": title,
+        "artist": artist,
+        "year": year,
+        "medium_and_dimensions": medium,
+        "description": raw_text,
+    }
 
 
 def extract_semi_structured(record):
@@ -213,11 +478,22 @@ def extract_semi_structured(record):
     if result:
         return result, "pattern_c_newline_narrative"
 
+    # Pattern D last: it is the most permissive of the deterministic patterns
+    # (no accession dependency at all), so it only ever sees text the three
+    # stricter patterns have already declined.
+    result, note = try_year_anchored_extraction(raw_text)
+    if result:
+        return result, note
+    pattern_d_note = note
+
     result = extract_via_llm_fallback(record)
     if result:
         return result, "llm_fallback"
 
-    return None, "needs_llm_fallback"
+    # Carry pattern D's specific reason forward instead of a bare
+    # "needs_llm_fallback" -- "rejected: artist='Published' is a publication
+    # verb" is actionable, "extraction failed" is not.
+    return None, f"needs_llm_fallback ({pattern_d_note})"
 
 
 # ---------------------------------------------------------------------------
@@ -438,10 +714,13 @@ def main(in_path, out_path):
     for method, count in method_counts.most_common():
         print(f"  {method:<30} {count}")
 
-    needs_fallback = [r for r in normalized if r["extraction_method"] == "needs_llm_fallback"]
+    # startswith, not ==, because the method string now carries pattern D's
+    # specific rejection reason in parentheses.
+    needs_fallback = [r for r in normalized
+                      if r["extraction_method"].startswith("needs_llm_fallback")]
     print(f"\nRecords needing LLM fallback (not yet resolved): {len(needs_fallback)}")
     for r in needs_fallback:
-        print(f"  {r['id']}")
+        print(f"  {r['id']}: {r['extraction_method']}")
 
     with open(out_path, "w", encoding="utf-8") as f:
         for r in normalized:
