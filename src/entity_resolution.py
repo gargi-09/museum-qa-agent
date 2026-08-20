@@ -16,20 +16,37 @@ on (title, artist), this lets us deterministically detect the assignment's
 core "same entity recorded differently by different institutions" scenario,
 without any fuzzy/probabilistic logic.
 
-VALIDATED AGAINST REAL DATA (not assumed): tested against the full base
-corpus and found 405 cross-institution candidate groups. Spot-checked two
-by hand (Witkiewicz's "Arthur Rubinstein, Zakopane"; Man Ray's "Return to
-Reason") -- both confirmed genuine matches via independent evidence
-(matching dimensions after unit conversion, near-identical descriptive
-content) -- not just coincidental title reuse.
+VALIDATED AGAINST REAL DATA (not assumed): tested against the full corpus
+and found 461 cross-institution candidate groups (610 groups total, of which
+149 are same-institution). Spot-checked two by hand (Witkiewicz's "Arthur
+Rubinstein, Zakopane"; Man Ray's "Return to Reason") -- both confirmed
+genuine matches via independent evidence (matching dimensions after unit
+conversion, near-identical descriptive content) -- not just coincidental
+title reuse.
+
+ALL NUMBERS IN THIS DOCSTRING WERE RECOMPUTED FROM SCRATCH against the
+current data/normalized.jsonl and diffed against what was written here. Four
+were stale and are corrected above and below; the correct-as-written ones are
+listed at the end so the audit is reproducible rather than just asserted.
+The cross-institution count was the largest drift -- 405 -> 461 -- and the
+cause is visible in this docstring's own structure: 405 was measured BEFORE
+the initial-vs-full-name matching rule described below was added. That rule
+unifies more records, which creates more groups, and the earlier figure was
+never revisited. A number measured before a change to the thing it measures
+is not evidence about the current system.
 
 SYSTEMATIC ARTIST-NAME AUDIT, run after test_pipeline.py revealed a real
 missed duplicate ("Louise Bourgeois" vs "L. Bourgeois") during integration
 testing -- rather than fix that one case and move on, ran a full-corpus,
 non-reactive scan for the same TWO underlying patterns:
   1. Initial vs. full first name (e.g. "L. Bourgeois" / "Louise
-     Bourgeois"): found 64 distinct pairs across the whole corpus, not
-     just the 1 found by accident. Handled via artists_match()'s
+     Bourgeois"): found 73 distinct pairs across the whole corpus, not
+     just the 1 found by accident. (Recount method, so this is
+     reproducible: take the set of DISTINCT artist strings, bucket them by
+     normalized surname, and count within-bucket pairs for which
+     artists_match() returns 'initial'. The previous figure of 64 may have
+     been a different counting method rather than drift -- stating the
+     method so the next recount is comparable.) Handled via artists_match()'s
      initial-matching rule, explicitly flagged low-confidence (small,
      accepted risk of merging two different people who share a surname
      and initial -- mitigated by requiring a matching, usually
@@ -44,10 +61,25 @@ non-reactive scan for the same TWO underlying patterns:
 
 BONUS FINDING: comparing already-normalized `years` lists (from ingest.py)
 between records in a confirmed group gives a SECOND deterministic check for
-free -- 244 of 405 groups (60%) show zero year overlap between institutions,
-a genuine, numeric, no-keyword-search-required contradiction signal. Far
-larger and more systematic than the ~18 records found via the earlier
-keyword-based scan ("at odds with", "discrepancy").
+free -- 274 of 461 cross-institution groups (59%) show zero year overlap
+between institutions, a genuine, numeric, no-keyword-search-required
+contradiction signal. Across ALL 610 groups (not just cross-institution),
+312 show a year contradiction. Far larger and more systematic than the 18
+records found via the earlier keyword-based scan ("at odds with",
+"discrepancy").
+
+AUDIT TRAIL -- every number above, recomputed fresh and diffed:
+    CORRECTED (was stale):
+      cross-institution groups              405 -> 461
+      initial-vs-full-name pairs             64 -> 73   (method now stated)
+      cross-inst groups, zero year overlap  244 -> 274
+      that as a percentage                   60% -> 59%
+    CONFIRMED STILL CORRECT:
+      institution vs id-prefix mismatches     0   (checked all 5,000 records)
+      diacritic-only ARTIST variant pairs     8
+      diacritic-only TITLE variant pairs      0
+      keyword-scan records ("at odds with"
+        / "discrepancy")                     18   (the "~" is now unnecessary)
 """
 import json
 import re
@@ -165,11 +197,45 @@ def build_entity_groups(records):
     artist matching above, which exact-key grouping can't express.
 
     Returns a list of group dicts, each with the records, whether it spans
-    multiple institutions, and a confidence flag. Confidence is 'low' if
-    EITHER the title is generic OR any member was matched via the
-    initial-name rule rather than an exact artist match -- both are
-    real, distinct sources of uncertainty, and neither should be hidden
-    behind a single silent "matched" result.
+    multiple institutions, and BOTH a coarse 'confidence' flag and an itemised
+    'low_confidence_reasons' list. The reasons matter because the two sources
+    of uncertainty are not interchangeable and one of them was being reported
+    as the other:
+
+      'generic_title'      -- the title is in GENERIC_TITLES, so these may be
+                              genuinely DISTINCT works that merely share a name.
+      'initial_name_match' -- at least one member was folded via artists_match()'s
+                              initial-vs-full-name rule rather than an exact
+                              artist match.
+
+    REAL BUG THIS FIXES, observed in the dev demo output. Previously there was
+    only a single boolean, and summarize_group_for_prompt() rendered every
+    low-confidence group with the generic-title wording. The Bourgeois group is
+    low-confidence for the OTHER reason -- 'L. Bourgeois' vs 'Louise Bourgeois'
+    -- and 'Ode to My Mother' is not a generic title, so the prompt asserted
+    something false and the model repeated it verbatim to the user:
+    "Both records note this is a generic title and these may be distinct works."
+    A fabrication the pipeline itself authored is worse than one the model
+    invents, because the model was being faithful to what it was told.
+
+    ROBUSTNESS CHANGE, deliberately NOT described as a bug fix, because it was
+    checked and it was not one. The flag used to be stored as
+    `used_initial_match.add(find(i))` -- a union-find ROOT captured at match
+    time -- which looks stale-able, since union() re-parents (`parent[ri] = rj`)
+    and a later merge moves the root. It is not reachable in practice: the
+    abbreviated-name record is compared against EVERY other same-title record,
+    the add runs after each of those unions, so the flag is re-added under the
+    current root every time; and any later exact-match union inside an
+    already-merged cluster is a no-op that cannot re-root it. Brute-forced over
+    5,586 synthetic configurations (2-4 records, 7 artist-name variants, 2
+    titles): ZERO divergence in the low/high verdict between the old root-based
+    version and the index-based one below.
+
+    Kept anyway because recording member INDICES is correct BY CONSTRUCTION
+    rather than by the argument above -- an index identifies a record
+    permanently, a root is a transient property of the forest -- so it stays
+    correct if the pairing loop or the union order is ever changed. That is a
+    cheaper thing to maintain than a subtle invariant about iteration order.
     """
     n = len(records)
     parent = list(range(n))
@@ -185,7 +251,9 @@ def build_entity_groups(records):
         if ri != rj:
             parent[ri] = rj
 
-    used_initial_match = set()
+    # Record INDICES, not roots -- see the docstring. An index identifies a
+    # record permanently; a root is a transient property of the forest.
+    initial_match_members = set()
 
     for i in range(n):
         title_i = normalize_title(records[i].get("title"))
@@ -201,27 +269,38 @@ def build_entity_groups(records):
             if is_match:
                 union(i, j)
                 if match_type == "initial":
-                    used_initial_match.add(find(i))
+                    initial_match_members.add(i)
+                    initial_match_members.add(j)
 
     clusters = defaultdict(list)
     for i in range(n):
         if normalize_title(records[i].get("title")):
-            clusters[find(i)].append(records[i])
+            clusters[find(i)].append(i)
 
     groups = []
-    for root, members in clusters.items():
-        if len(members) < 2:
+    for member_idxs in clusters.values():
+        if len(member_idxs) < 2:
             continue
+        members = [records[i] for i in member_idxs]
         norm_title = normalize_title(members[0].get("title"))
         institutions = set(m["institution"] for m in members)
-        is_low_confidence = norm_title in GENERIC_TITLES or root in used_initial_match
+
+        low_confidence_reasons = []
+        if norm_title in GENERIC_TITLES:
+            low_confidence_reasons.append("generic_title")
+        if any(i in initial_match_members for i in member_idxs):
+            low_confidence_reasons.append("initial_name_match")
+
         groups.append({
             "normalized_title": norm_title,
             "normalized_artist": normalize_artist(members[0].get("artist")),
             "members": members,
             "spans_institutions": len(institutions) > 1,
             "institutions": institutions,
-            "confidence": "low" if is_low_confidence else "high",
+            "low_confidence_reasons": low_confidence_reasons,
+            # Retained so existing readers (test_pipeline.py, main() below)
+            # keep working -- this is now derived from the reasons above.
+            "confidence": "low" if low_confidence_reasons else "high",
         })
     return groups
 
@@ -297,8 +376,22 @@ def summarize_group_for_prompt(group):
     else:
         note_parts.append(f"{len(other_ids)} additional related catalog entries: {other_ids}")
 
-    if group["confidence"] == "low":
+    # One note per REASON. Emitting the generic-title wording for every
+    # low-confidence group put a false statement in the prompt, which the model
+    # then repeated to the user -- see build_entity_groups()'s docstring.
+    # Falls back to the old behaviour only for a group dict built before
+    # low_confidence_reasons existed, so an external caller cannot crash here.
+    reasons = group.get("low_confidence_reasons")
+    if reasons is None:
+        reasons = ["generic_title"] if group.get("confidence") == "low" else []
+
+    if "generic_title" in reasons:
         note_parts.append("NOTE: generic title -- these may be DISTINCT works, not confirmed duplicates.")
+    if "initial_name_match" in reasons:
+        note_parts.append("NOTE: these were folded on an initial-vs-full-name artist "
+                          "match (e.g. 'L. Bourgeois' / 'Louise Bourgeois'), not an exact "
+                          "name match. Probably the same person, but a shared surname and "
+                          "initial could in principle belong to two different people.")
 
     if has_contradiction:
         sorted_votes = sorted(vote_counts.items(), key=lambda x: -x[1])
@@ -342,8 +435,16 @@ def main():
     print(f"  Cross-institution (assignment's core scenario): {len(cross_inst)}")
     print(f"  Same-institution (multi-part/proof clusters): {len(same_inst)}")
 
+    # Broken out by REASON. The old single line said "(generic title)" for every
+    # low-confidence group, which mislabelled every initial-name fold.
     low_conf = [g for g in groups if g["confidence"] == "low"]
-    print(f"  Low-confidence (generic title): {len(low_conf)}")
+    generic = [g for g in groups if "generic_title" in g["low_confidence_reasons"]]
+    initial = [g for g in groups if "initial_name_match" in g["low_confidence_reasons"]]
+    both = [g for g in groups if len(g["low_confidence_reasons"]) > 1]
+    print(f"  Low-confidence (any reason): {len(low_conf)}")
+    print(f"    generic title:              {len(generic)}")
+    print(f"    initial-vs-full-name fold:  {len(initial)}")
+    print(f"    both reasons:               {len(both)}")
 
     contradictions = [g for g in groups if check_year_contradiction(g)[0]]
     print(f"\nGroups with a deterministic year contradiction: {len(contradictions)}")

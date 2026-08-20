@@ -106,9 +106,6 @@ ABSTENTION_THRESHOLD = 0.35
 #
 # CONSEQUENCE, stated plainly rather than buried: this gate WILL falsely abstain
 # on some legitimate questions, and that is not fixable by re-tuning the number.
-# Measured scope of the damage on what is actually being submitted: zero of the
-# eight demo questions, and zero of the six ground-truth pairs in
-# test_embedding_choice.py (which score 34.27-40.51, far clear of the floor).
 # The false abstention above is on a paraphrase deliberately constructed to
 # avoid every title, artist and medium term -- harder than anything a real user
 # is likely to type, but not impossible.

@@ -398,14 +398,42 @@ def parse_haiku_response(raw_content):
 # Verification suite -- deterministic checks run AFTER Haiku answers
 # ---------------------------------------------------------------------------
 
+# A check that CANNOT FAIL must not report a pass. Every check below returns
+# inconclusive=True when the conditions it needs to detect anything are absent,
+# and run_verification_suite() excludes those from the pass-rate denominator.
+#
+# WHY: on the dev demo run, a correct decline citing zero records reported 3/3
+# verification passes, because every check iterates the cited records and there
+# were none. That fed a 1.0 verification_score into confidence and produced
+# 0.88/"high" for an answer that asserted nothing. Fix 1 stops scoring those
+# responses at all; this makes the checks themselves say why they were silent
+# instead of claiming a clean bill of health.
+#
+# NOTE on the `passed` key when inconclusive is set: it is left True so that a
+# consumer reading only `passed` does not render a FAIL for a check that did not
+# fail either. `passed` is MEANINGLESS when inconclusive is True -- read
+# inconclusive first. main.format_result_md() does.
+INCONCLUSIVE_NO_CITATIONS = (
+    "INCONCLUSIVE -- the response cited no records, so this check had nothing to "
+    "examine. It did not pass; it could not run."
+)
+
+
 def check_citation_membership(parsed_response, context_blocks):
     """Are all cited record IDs actually among the records Haiku was given?
     Catches fabricated citations. Pure set membership, free.
+
+    Reports inconclusive rather than a pass when nothing was cited -- an empty
+    citation set trivially contains no fabricated citations, which is not
+    evidence that the response is well-grounded.
     """
     if not parsed_response:
         return {"passed": False, "detail": "no response to check"}
     valid_ids = set(b["id"] for b in context_blocks)
-    used_ids = set(parsed_response.get("record_ids_used", []))
+    used_ids = set(parsed_response.get("record_ids_used") or [])
+    if not used_ids:
+        return {"passed": True, "inconclusive": True,
+                "detail": INCONCLUSIVE_NO_CITATIONS}
     fabricated = used_ids - valid_ids
     return {
         "passed": len(fabricated) == 0,
@@ -423,27 +451,63 @@ def check_not_recorded_violation(parsed_response, context_blocks):
         return {"passed": False, "detail": "no response to check"}
 
     answer_text = (parsed_response.get("answer") or "").lower()
-    used_ids = set(parsed_response.get("record_ids_used", []))
+    used_ids = set(parsed_response.get("record_ids_used") or [])
+    if not used_ids:
+        return {"passed": True, "inconclusive": True,
+                "detail": INCONCLUSIVE_NO_CITATIONS}
     blocks_by_id = {b["id"]: b for b in context_blocks}
 
+    # THE GUARD, and why it is now reported rather than trusted. These terms
+    # suppress the substring test below for EVERY field on EVERY cited record,
+    # because answer_text is the whole answer. Measured on the dev demo run:
+    # the dimensions question's answer contained "[not recorded]" three times,
+    # so the check was structurally dead and still reported
+    # "no violations detected" -- an unfailable check claiming a clean result,
+    # which is the brief's "absence of an error treated as success" exactly.
+    guard_terms = [t for t in ("not recorded", "unknown") if t in answer_text]
+
     violations = []
+    in_scope = []
     for rid in used_ids:
         block = blocks_by_id.get(rid)
         if not block:
             continue
         for field, value in block["fields"].items():
             if value == "[not recorded]":
+                # Every [not recorded] field on a cited record is something
+                # this check is SUPPOSED to be watching. Counted separately so
+                # the detail string can say how much went unexamined.
+                in_scope.append(f"{rid}.{field}")
                 # crude but cheap: if the answer mentions this field name
                 # in a way that suggests it stated a value, flag for review
                 # (this is intentionally conservative -- a real
                 # implementation might check more precisely)
-                if field in answer_text and "not recorded" not in answer_text and "unknown" not in answer_text:
+                if field in answer_text and not guard_terms:
                     violations.append((rid, field))
 
-    return {
-        "passed": len(violations) == 0,
-        "detail": f"possible violations: {violations}" if violations else "no violations detected",
-    }
+    if violations:
+        return {"passed": False,
+                "detail": f"possible violations: {violations}"}
+
+    if guard_terms and in_scope:
+        return {
+            "passed": True,
+            "inconclusive": True,
+            "detail": (f"INCONCLUSIVE -- the answer contains {guard_terms}, which "
+                       f"suppresses this substring-based check for ALL fields on ALL "
+                       f"cited records. {len(in_scope)} field(s) marked [not recorded] "
+                       f"were in scope and went unexamined: {in_scope}. No violation "
+                       f"was detected, but none could have been."),
+        }
+
+    if not in_scope:
+        return {"passed": True,
+                "detail": "no violations possible -- no cited record has a "
+                          "[not recorded] field for the answer to fill in"}
+
+    return {"passed": True,
+            "detail": f"no violations detected across {len(in_scope)} "
+                      f"[not recorded] field(s) in scope: {in_scope}"}
 
 
 def check_factual_match(parsed_response, context_blocks):
@@ -458,12 +522,19 @@ def check_factual_match(parsed_response, context_blocks):
     if not parsed_response:
         return {"passed": False, "detail": "no response to check"}
 
+    # Citation check FIRST, so an uncited response reports the same
+    # inconclusive reason as the other two checks rather than the incidental
+    # "no year mentioned" one.
+    used_ids = set(parsed_response.get("record_ids_used") or [])
+    if not used_ids:
+        return {"passed": True, "inconclusive": True,
+                "detail": INCONCLUSIVE_NO_CITATIONS}
+
     answer_text = parsed_response.get("answer") or ""
     answer_years = set(normalize_year(answer_text))
     if not answer_years:
         return {"passed": True, "detail": "no year mentioned in answer -- nothing to check"}
 
-    used_ids = set(parsed_response.get("record_ids_used", []))
     blocks_by_id = {b["id"]: b for b in context_blocks}
 
     mismatches = []
@@ -489,14 +560,95 @@ def check_factual_match(parsed_response, context_blocks):
     }
 
 
-def run_verification_suite(parsed_response, context_blocks):
+def check_not_truncated(haiku_result):
+    """Was the response complete, or did truncation detection fire?
+
+    WHY THIS IS A VERIFICATION CHECK AND NOT A FOOTNOTE: silent truncation is
+    the ONE fault the brief injects, and api_client.detect_truncation() was
+    already finding it -- the flag was returned all the way up to
+    answer_question() and then nothing read it. So a response that survived
+    call_haiku()'s single retry and was STILL truncated came back with three
+    clean checks and a full confidence score. Detecting the injected fault and
+    then not reporting it is worse than not detecting it, because it produces a
+    confident answer built on text that stops mid-thought.
+
+    Counted in the pass rate, not merely displayed: a check that is shown but
+    excluded from scoring is the same half-measure in a new place. Note this is
+    score-NEUTRAL for clean answers -- 4/4 and 3/3 are both a 1.0 rate -- and
+    only bites when truncation actually fires, which is the intended behaviour.
+    """
+    if not haiku_result:
+        return {"passed": True, "inconclusive": True,
+                "detail": "INCONCLUSIVE -- no API result was available to inspect."}
+
+    if haiku_result.get("is_truncated"):
+        reasons = haiku_result.get("truncation_reasons") or []
+        return {
+            "passed": False,
+            "detail": (f"TRUNCATION SUSPECTED -- this response still tripped truncation "
+                       f"detection after call_haiku()'s retry. Signals that fired: "
+                       f"{reasons}. Treat the answer as possibly INCOMPLETE: the missing "
+                       f"content is cut off, not absent, so anything the answer does not "
+                       f"mention may simply never have been emitted."),
+        }
+
+    # THE FAULT FIRED AND WAS RECOVERED. This is NOT the same as "no truncation",
+    # and reporting it as such was hiding the only evidence that the injected
+    # fault had ever been exercised: the retry's return value replaces the
+    # truncated attempt's, so a successful recovery left no trace in the result.
+    prior = haiku_result.get("prior_truncation")
+    if prior:
+        return {
+            "passed": True,
+            "recovered": True,
+            "detail": (f"TRUNCATION DETECTED AND RECOVERED -- attempt "
+                       f"{prior.get('attempt')} (call_seq {prior.get('call_seq')}) came "
+                       f"back truncated and was retried; this answer is the clean retry. "
+                       f"Signals that fired on the truncated attempt: "
+                       f"{prior.get('reasons')}. The answer below is complete, but this "
+                       f"question cost TWO paid calls, and the injected silent-truncation "
+                       f"fault is confirmed to have fired here."),
+        }
+
+    return {"passed": True, "detail": "no truncation signal fired"}
+
+
+def score_checks(checks):
+    """(passed, scorable_total) over a checks dict, excluding inconclusive ones.
+
+    Single definition of the pass rate, so adding a check anywhere cannot
+    accidentally use a different denominator rule than the others.
+    """
+    scorable = [c for c in checks.values() if not c.get("inconclusive")]
+    return sum(1 for c in scorable if c["passed"]), len(scorable)
+
+
+def run_verification_suite(parsed_response, context_blocks, haiku_result=None):
+    """Runs every check and returns (checks, passed_count, scorable_count).
+
+    scorable_count EXCLUDES checks that reported inconclusive=True, so the
+    pass rate is computed only over checks that could actually have failed.
+    Counting an inconclusive check as a pass is what let a response citing
+    nothing report 3/3 and score 0.88/"high" -- the denominator has to shrink
+    with the numerator or the rate is measuring the wrong thing.
+
+    Consequence worth knowing: when every check is inconclusive, this returns
+    a total of 0, and compute_confidence() already treats a zero total as a
+    0.0 verification_score. In practice confidence_for_response() short-circuits
+    those responses before the score is ever used.
+
+    haiku_result is OPTIONAL so this stays callable with two arguments by any
+    existing caller or test. When supplied, the truncation check is included.
+    """
     checks = {
         "citation_membership": check_citation_membership(parsed_response, context_blocks),
         "not_recorded_violation": check_not_recorded_violation(parsed_response, context_blocks),
         "factual_match": check_factual_match(parsed_response, context_blocks),
     }
-    passed_count = sum(1 for c in checks.values() if c["passed"])
-    return checks, passed_count, len(checks)
+    if haiku_result is not None:
+        checks["not_truncated"] = check_not_truncated(haiku_result)
+    passed_count, scorable_total = score_checks(checks)
+    return checks, passed_count, scorable_total
 
 
 # ---------------------------------------------------------------------------
@@ -517,21 +669,120 @@ def compute_confidence(best_similarity, verification_passed, verification_total,
     raw_score = (0.5 * retrieval_score) + (0.5 * verification_score) - contradiction_penalty
     score = max(0.0, min(1.0, raw_score))
 
-    if score >= 0.75:
-        label = "high"
-    elif score >= 0.45:
-        label = "medium"
+    # Band the ROUNDED score -- the same number that gets reported. Banding the
+    # unrounded value made the two disagree at the boundary: retrieval 0.70 with
+    # 1 of 5 checks passing gives 0.44999999999999996, which reports as
+    # "score": 0.45 while landing in the "low" band, even though the documented
+    # boundary is >= 0.45 -> medium. Anyone recomputing the label from the
+    # printed score would get a different answer than the system did, which
+    # defeats the point of exposing the number at all.
+    reported_score = round(score, 2)
+
+    if reported_score >= 0.75:
+        raw_label = "high"
+    elif reported_score >= 0.45:
+        raw_label = "medium"
     else:
-        label = "low"
+        raw_label = "low"
+
+    # LABEL CAP: never "high" when a check that COULD have failed DID fail.
+    #
+    # WHY: the arithmetic alone put a caught fabrication in the "high" band. A
+    # response citing a record it was never shown scored 0.78 -- one failed
+    # check out of four leaves verification_score at 0.75, and 0.5*0.83 + 0.375
+    # still clears the 0.75 threshold. Same for a truncated response at 0.76.
+    # So verification could catch the single worst failure mode in the system,
+    # correctly lower the number, and still hand back the word "high".
+    #
+    # The label is what a reader acts on; the score is what they audit. A label
+    # that says "high" while a deterministic check is failing is the brief's
+    # "confidence numbers with nothing behind them" surviving in the one field
+    # most likely to be read on its own.
+    #
+    # This only ever DOWNGRADES. A response already at medium or low is not
+    # promoted, and inconclusive checks are excluded upstream by score_checks()
+    # so they cannot trigger the cap -- only a genuine failure can.
+    any_check_failed = bool(verification_total) and verification_passed < verification_total
+    label = "medium" if (any_check_failed and raw_label == "high") else raw_label
 
     return {
-        "score": round(score, 2),
+        "score": reported_score,
         "label": label,
         "components": {
             "retrieval_score": round(retrieval_score, 2),
             "verification_score": round(verification_score, 2),
             "contradiction_penalty": contradiction_penalty,
+            # True only when the cap ACTUALLY changed the label, so the flag is
+            # not itself a slightly-false statement on responses where the
+            # label was already below "high".
+            "label_capped_by_failed_check": label != raw_label,
         },
+    }
+
+
+# Used when the response cited NOTHING. Every check below is vacuous, so the
+# second clause is literally true.
+NOT_APPLICABLE_CONFIDENCE_REASON = (
+    "no factual claim was asserted and no record was cited, so there is nothing "
+    "to be confident about. The verification checks below pass vacuously on an "
+    "empty citation set and are reported as inconclusive, not as passes."
+)
+
+# Used when the model set answerable=false but DID cite records -- which is what
+# the dev demo's dimensions question actually did. The reason has to differ,
+# because saying "no record was cited" there would itself be a false statement
+# in user-facing output, which is exactly the failure mode this pass is fixing
+# elsewhere. Same verdict, accurate justification.
+NOT_APPLICABLE_DECLINED_REASON = (
+    "the model set answerable=false, so no factual claim was asserted and there is "
+    "nothing to be confident about. Records WERE cited (see record_ids_used), so "
+    "the checks below did run against them -- but a pass rate on a response that "
+    "asserts nothing is not evidence about anything, and is deliberately not "
+    "converted into a score."
+)
+
+
+def confidence_for_response(parsed_response, best_similarity, verification_passed,
+                             verification_total, has_contradiction_on_used_records):
+    """Decides whether a confidence score is MEANINGFUL for this response at
+    all, and only then delegates to compute_confidence().
+
+    REAL BUG THIS FIXES, measured on the dev demo run: a correct DECLINE was
+    reported at 0.88/"high". Three of the eight demo questions did it, and all
+    three were the system working exactly as designed.
+
+    The mechanism is that every verification check passes VACUOUSLY on an empty
+    citation set -- check_citation_membership has no citations to find
+    fabricated, check_not_recorded_violation iterates an empty used_ids, and
+    check_factual_match reports "no year mentioned in answer". So
+    verification_score is 1.0 and 0.5*0.77 + 0.5*1.0 rounds to 0.88 for an
+    answer that asserts nothing about anything.
+
+    That is both of the brief's §7 anti-patterns in one field: a confidence
+    number with nothing behind it, and the absence of a detectable error being
+    read as success.
+
+    A response that cites nothing therefore gets NO score -- not a low one. A
+    low score is still a claim about how well-supported an answer is, and there
+    is no answer to support. `reason` says why, so the absence is explained
+    rather than merely blank.
+    """
+    cited = (parsed_response.get("record_ids_used") or []) if parsed_response else []
+    answerable = parsed_response.get("answerable") if parsed_response else None
+
+    if not cited:
+        reason = NOT_APPLICABLE_CONFIDENCE_REASON
+    elif not answerable:
+        reason = NOT_APPLICABLE_DECLINED_REASON
+    else:
+        return compute_confidence(best_similarity, verification_passed,
+                                   verification_total, has_contradiction_on_used_records)
+
+    return {
+        "score": None,
+        "label": "not_applicable",
+        "reason": reason,
+        "components": None,
     }
 
 
@@ -615,7 +866,8 @@ def answer_question(question, retriever, dev_mode=False, top_k=10,
             "raw_content": haiku_result["content"],
         }
 
-    checks, passed, total = run_verification_suite(parsed_response, context_blocks)
+    checks, passed, total = run_verification_suite(parsed_response, context_blocks,
+                                                    haiku_result=haiku_result)
 
     has_contradiction = any(
         b["internal_contradiction"] is not None
@@ -623,7 +875,8 @@ def answer_question(question, retriever, dev_mode=False, top_k=10,
         if b["id"] in set(parsed_response.get("record_ids_used", []))
     )
 
-    confidence = compute_confidence(best_sim, passed, total, has_contradiction)
+    confidence = confidence_for_response(parsed_response, best_sim, passed, total,
+                                          has_contradiction)
 
     full_provenance = build_full_provenance(context_blocks, folded_ids_map, parsed_response)
 
@@ -637,7 +890,21 @@ def answer_question(question, retriever, dev_mode=False, top_k=10,
         "full_provenance": full_provenance,
         "confidence": confidence,
         "verification_checks": checks,
+        # The retrieval evidence behind confidence.components.retrieval_score.
+        # Previously published ONLY on the abstain path, which meant the one
+        # number a reader would want to interrogate came with nothing to
+        # interrogate it against on every answered question.
+        "retrieval_signals": signals,
+        # Retained for backward compatibility with anything reading the flag
+        # directly; the graded outcome now lives in
+        # verification_checks["not_truncated"].
         "is_truncated": haiku_result["is_truncated"],
+        # Evidence that the injected fault fired on this question even though the
+        # answer that came back is complete. Surfaced at top level, not only
+        # inside the check, because "this cost two calls" is a budget fact as
+        # well as a verification one.
+        "truncation_recovered": bool(haiku_result.get("truncation_recovered")),
+        "prior_truncation": haiku_result.get("prior_truncation"),
         "call_seq": haiku_result["call_seq"],
         "budget_remaining": haiku_result["budget_remaining"],
     }

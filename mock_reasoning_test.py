@@ -6,14 +6,13 @@ call_haiku() with a fake function that returns hand-crafted responses.
 WHAT STAYS REAL: retrieval (BM25 + embeddings), entity resolution,
 contradiction detection, prompt assembly, response parsing, the
 verification suite, provenance tracking, confidence scoring -- all of
-this is your ACTUAL code, actually running.
+this is the actual pipeline code, running for real.
 
-WHAT'S FAKED: only the network call itself. We craft the exact JSON
-string Haiku WOULD have returned, for several deliberate scenarios
+WHAT'S FAKED: only the network call itself. This crafts the exact JSON
+string Haiku would have returned, for several deliberate scenarios
 (a clean answer, a fabricated citation, a not-recorded violation, a
-wrong year, a missing exclusion reason) -- so you can see your
-verification suite actually catch each one, on purpose, before ever
-spending a real token.
+wrong year, a missing exclusion reason) -- so the verification suite
+can be seen catching each one, on purpose, before spending a real token.
 
 Usage: python mock_reasoning_test.py data/normalized.jsonl
 """

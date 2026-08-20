@@ -6,25 +6,7 @@ every real network call goes through call_haiku() so token logging,
 truncation detection, and error handling are enforced in exactly one
 place.
 
-STATUS: Real logic is written and testable, but gated behind a
-credentials check -- if CORTEX_API_KEY / CORTEX_MODEL_ENDPOINT /
-CORTEX_DATA_BASE aren't in .env yet, call_haiku() returns a clear
-"missing_credentials" result instead of attempting a real request.
-This lets everything downstream (reasoning.py) be built and tested
-against this file's structure/return shape without needing real
-credentials yet, and without risking an accidental real call.
-
-Expected .env variables (adjust exact names once confirmed against the
-actual email from Leia -- these are best-guess placeholder names):
-    CORTEX_API_KEY
-    CORTEX_MODEL_ENDPOINT
-    CORTEX_DATA_BASE
-
-Optional .env overrides, all defaulted to match the brief's §3 client:
-    CORTEX_MESSAGE_FORMAT   openai | anthropic   (default: openai)
-    CORTEX_SEND_MODEL       0 | 1                (default: 0 -- no 'model')
-    CORTEX_MODEL            model id, only used if CORTEX_SEND_MODEL=1
-    CORTEX_TEMPERATURE      float                (default: 0.0)
+Optional .env overrides, all defaulted to match the brief
 
 The wire contract here mirrors the brief's documented client exactly:
     POST {CORTEX_MODEL_ENDPOINT}
@@ -677,7 +659,8 @@ def _prepend_system(messages, system):
 # ---------------------------------------------------------------------------
 
 def call_haiku(messages, max_tokens=1024, dev_mode=False, stage="unspecified",
-                expect_json=False, system=None, temperature=None, _retry_count=0):
+                expect_json=False, system=None, temperature=None, _retry_count=0,
+                _prior_truncation=None):
     """Makes a request to the Cortex Haiku endpoint.
 
     Returns a dict:
@@ -693,6 +676,14 @@ def call_haiku(messages, max_tokens=1024, dev_mode=False, stage="unspecified",
             on retry-exhausted 5xx. Read it with .get(): it is only set on
             those paths, since the other error returns have no server body
             to report.
+        prior_truncation: dict or None -- present only on a response that is
+            itself the RETRY of a truncated attempt. Carries that attempt's
+            call_seq, the signals that fired, and its usage. Read it with
+            .get(): only the success path sets it.
+        truncation_recovered: bool -- True when an earlier attempt was
+            truncated and THIS one was not. Distinct from is_truncated=False
+            with no prior_truncation, which means the fault never fired at all.
+            Only the success path sets it; read with .get().
 
     The system prompt is passed via `system`, NOT as a {"role": "system"}
     entry in messages -- build_payload() decides where it belongs on the
@@ -892,10 +883,23 @@ def call_haiku(messages, max_tokens=1024, dev_mode=False, stage="unspecified",
               f"retrying in {RETRY_DELAY_TRUNCATION_SECONDS}s with a fresh call_seq "
               f"(this retry uses real token budget)...")
         time.sleep(RETRY_DELAY_TRUNCATION_SECONDS)
+        # Hand the first attempt's evidence to the retry. WHY THIS MATTERS: the
+        # retry's return value is what the caller receives, so without this the
+        # ONLY record that the injected fault ever fired was a console line and
+        # a doubled token cost. A recovered truncation would report
+        # is_truncated=False and every downstream check would say "no truncation
+        # signal fired" -- the fault detected, handled correctly, and then made
+        # invisible in the artifact that is supposed to demonstrate handling it.
         return call_haiku(messages, max_tokens=max_tokens, dev_mode=dev_mode,
                            stage=stage, expect_json=expect_json, system=system,
                            temperature=temperature,
-                           _retry_count=_retry_count + 1)
+                           _retry_count=_retry_count + 1,
+                           _prior_truncation={
+                               "attempt": _retry_count + 1,
+                               "call_seq": call_seq,
+                               "reasons": truncation_reasons,
+                               "usage": usage,
+                           })
 
     return {
         "content": content,
@@ -906,6 +910,12 @@ def call_haiku(messages, max_tokens=1024, dev_mode=False, stage="unspecified",
         "should_retry": False,
         "call_seq": call_seq,
         "budget_remaining": budget_remaining,
+        # Set when an EARLIER attempt was truncated and this one is the retry.
+        # None on the common path. When present with is_truncated=False it means
+        # "the fault fired and we recovered", which is a materially different
+        # story from "the fault never fired" and must not look the same.
+        "prior_truncation": _prior_truncation,
+        "truncation_recovered": bool(_prior_truncation) and not is_truncated,
     }
 
 

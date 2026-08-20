@@ -28,7 +28,8 @@ from datetime import datetime, timezone
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from api_client import get_tracker, check_credentials
-from retrieval import HybridRetriever, load_records, ABSTENTION_THRESHOLD
+from retrieval import (HybridRetriever, load_records, ABSTENTION_THRESHOLD,
+                        BM25_ABSTENTION_THRESHOLD)
 from reasoning import answer_question
 
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
@@ -68,6 +69,24 @@ DEMO_QUESTIONS = [
                "disagreement rather than silently pick one.",
         "expect": "answers with contradiction flagged",
     },
+        {
+        "q": "When was Jeff Brouws's Railroad Landscape #33 in Pine Plains, "
+             "New York made?",
+        "why": "Exercises CROSS-record contradiction, which nothing else in "
+               "this set does -- the Omer Fast question above is intra-record "
+               "(one record's prose against its own structured year). Here "
+               "two institutions catalogue the same work with no year in "
+               "common: aic-13026 says 2012, cma-169223 says '2009, printed "
+               "2010'. Two caveats, stated rather than hidden: "
+               "check_year_contradiction() only tests for zero year overlap, "
+               "so it cannot tell a disagreement from two different "
+               "printings, and the answer inherits that overstatement from "
+               "the prompt; and contradiction_penalty stays 0.0 here by "
+               "design, so this scores higher than Omer Fast. Both are "
+               "explained in the writeup.",
+        "expect": "answers and flags the cross-institution date disagreement "
+                  "-- but is not penalised for it",
+    },
     {
         "q": "What are the dimensions of the works in the corpus with no recorded "
              "dimensions?",
@@ -80,24 +99,49 @@ DEMO_QUESTIONS = [
     {
         "q": "Which prints in the collection use a predominantly red palette?",
         "why": "not a clean failure, but a genuine, nuanced demonstration of the "
-               "limits of opportunistic text-grounding for visual properties",
-        "expect": "falls over",
+               "limits of opportunistic text-grounding for visual properties. "
+               "MEASURED: it answers, citing records whose PROSE happens to "
+               "mention red, and correctly excludes non-prints. It never looks "
+               "at an image, so it can only find colour that someone wrote down.",
+        "expect": "answers from text that happens to mention colour -- not from vision",
     },
     {
         "q": "What did Helen Frankenthaler think about Abstract Expressionism?",
-        "why": "FALLS OVER BY DESIGN, and it is the brief's own example. "
-               "Catalog entries describing her paintings are highly relevant "
-               "but do not state her opinions. A confident answer here would be "
-               "the system failing while looking like it worked.",
-        "expect": "falls over",
+        "why": "FALLS OVER BY DESIGN, and it tests the exact relevance-vs-"
+               "answerability pattern the brief describes. Catalog entries "
+               "describing her paintings are highly relevant but do not "
+               "state her opinions. A confident answer here would be the "
+               "system failing while looking like it worked. MEASURED: it "
+               "declines correctly and cites nothing, which is the system "
+               "WORKING -- and it is why confidence is reported as "
+               "not_applicable rather than the 0.88/high it used to return "
+               "for exactly this response.",
+        "expect": "declines -- relevance is not answerability. Confidence not_applicable",
     },
     {
         "q": "What is the melting point of gallium arsenide?",
-        "why": "Exercises the abstention gate. Nothing in a museum corpus "
-               "supports this, so retrieval similarity should fall below "
-               f"{ABSTENTION_THRESHOLD} and the system should abstain BEFORE "
-               "spending a paid call.",
-        "expect": "abstains",
+        "why": "Exercises the abstention gate on genuine junk. Nothing in a "
+               "museum corpus supports this; measured BM25 18.50, below the "
+               f"{BM25_ABSTENTION_THRESHOLD} floor, so the system abstains BEFORE "
+               "spending a paid call. Note the dense check does NOT fire here "
+               f"({ABSTENTION_THRESHOLD} sits far below bge-small's noise floor) "
+               "-- BM25 is what catches this.",
+        "expect": "abstains -- correctly, at zero token cost",
+    },
+    {
+        "q": "What did Picasso think about Cubism?",
+        "why": "A FALSE ABSTENTION, and the sharpest evidence in this set that no "
+               "absolute BM25 floor can separate answerable from unanswerable. This "
+               "is a legitimate, in-domain art-history question and the gate refuses "
+               f"it at BM25 15.73, below {BM25_ABSTENTION_THRESHOLD} -- while "
+               "'What did Helen Frankenthaler think about Abstract Expressionism?', "
+               "the SAME question shape, scores 23.48 and is admitted. Nothing "
+               "separates them but how common their vocabulary happens to be in this "
+               "corpus. Worse, the junk question above (18.50) scores HIGHER than "
+               "this answerable one. Included because it is un-constructed -- unlike "
+               "the Eva Hesse paraphrase in the writeup, nobody built this to fail. "
+               "Costs zero tokens: abstention precedes any paid call.",
+        "expect": "abstains -- a FALSE abstention. See writeup section (b)",
     },
     {
         "q": "How many works in the collection are by artists whose names were "
@@ -105,8 +149,14 @@ DEMO_QUESTIONS = [
         "why": "Aggregate question over the whole corpus, which a top-k "
                "retrieval funnel structurally cannot answer -- it only ever "
                "sees 10 records. Included to show a known architectural limit "
-               "rather than leave it for the reader to discover.",
-        "expect": "falls over",
+               "rather than leave it for the reader to discover. NOTE from "
+               "live testing: the system did decline correctly, but its "
+               "stated reasoning cited the absence of a specific evidence "
+               "type in this specific sample, not the general architectural "
+               "limit -- so the decline may be sample-dependent rather than "
+               "structurally guaranteed. See the writeup.",
+        "expect": "declines -- but for sample-specific reasons, not the "
+                  "architectural limit it was chosen to demonstrate",
     },
 ]
 
@@ -174,9 +224,16 @@ def format_result_md(item, result):
             lines.append(f"> {result['error_detail']}")
     else:
         conf = result.get("confidence") or {}
+        # score is None when the response asserted nothing and cited nothing --
+        # see reasoning.confidence_for_response(). Rendering "confidence=None"
+        # would read as a missing value rather than a deliberate one, so say
+        # what it means instead.
+        if conf.get("score") is None:
+            conf_text = f"confidence={conf.get('label', 'not_applicable')} (no score)"
+        else:
+            conf_text = f"confidence={conf.get('score')} ({conf.get('label')})"
         lines.append(f"**Outcome: answered.** "
-                     f"answerable={result.get('answerable')}, "
-                     f"confidence={conf.get('score')} ({conf.get('label')})")
+                     f"answerable={result.get('answerable')}, {conf_text}")
         lines.append("")
         lines.append(f"> {result.get('answer')}")
         lines.append("")
@@ -185,12 +242,29 @@ def format_result_md(item, result):
             lines.append("")
         lines.append(f"*Records cited:* {result.get('record_ids_used')}")
         lines.append("")
-        lines.append(f"*Confidence components:* `{json.dumps(conf.get('components', {}))}`")
+        if conf.get("components") is None:
+            lines.append(f"*Confidence not scored:* {conf.get('reason', 'no reason recorded')}")
+        else:
+            lines.append(f"*Confidence components:* `{json.dumps(conf['components'])}`")
         lines.append("")
         checks = result.get("verification_checks") or {}
         lines.append("*Verification:*")
         for name, c in checks.items():
-            mark = "PASS" if c.get("passed") else "FAIL"
+            # INCONCLUSIVE is a third outcome, not a flavour of PASS. A check
+            # that could not run must not be rendered as one that ran and
+            # found nothing wrong. `passed` is meaningless when inconclusive
+            # is set, so it is read first.
+            if c.get("inconclusive"):
+                mark = "INCONCLUSIVE"
+            elif c.get("recovered"):
+                # A pass that only happened because a retry saved it. Rendering
+                # this as a plain PASS is what would hide the injected fault
+                # having fired at all.
+                mark = "PASS (RECOVERED)"
+            elif c.get("passed"):
+                mark = "PASS"
+            else:
+                mark = "FAIL"
             lines.append(f"  - `{name}`: **{mark}** — {c.get('detail')}")
         lines.append("")
         prov = result.get("full_provenance") or []
@@ -227,9 +301,13 @@ def cmd_demo(args, dev):
         f"Mode: {'dev sandbox (X-Cortex-Mode: dev)' if dev else 'REAL submission budget'}",
         f"Abstention threshold: {ABSTENTION_THRESHOLD}",
         "",
-        f"{len(DEMO_QUESTIONS)} questions, run end to end. Four are expected to "
-        "decline, abstain, or fail outright — those are included deliberately, "
-        "not omitted.",
+        # Counted, not hardcoded. This said "Four" while the set had five
+        # non-answers, and a header that miscounts its own contents is the
+        # cheapest possible way to lose a reader's trust in the numbers below it.
+        f"{len(DEMO_QUESTIONS)} questions, run end to end. "
+        f"{sum(1 for q in DEMO_QUESTIONS if q['expect'].startswith(('declines', 'abstains')))} "
+        "are expected to decline or abstain rather than answer — those are "
+        "included deliberately, not omitted.",
         "",
         "---",
         "",

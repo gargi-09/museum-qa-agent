@@ -4,8 +4,8 @@ contradiction.py into one pipeline, WITHOUT calling the API at all.
 
 PURPOSE: validate that these three modules work correctly TOGETHER before
 spending any real tokens on api_client.py / reasoning.py. This prints
-exactly what WOULD be sent to Haiku, so you can eyeball whether the
-assembled context looks sensible before committing to the paid step.
+exactly what WOULD be sent to Haiku, making it possible to eyeball whether
+the assembled context looks sensible before committing to the paid step.
 
 Usage:
     python test_pipeline.py data/normalized.jsonl "your question here"

@@ -290,9 +290,7 @@ def try_year_anchored_extraction(raw_text):
 # LLM fallback -- the ONLY thing in this module that can cost tokens
 # ---------------------------------------------------------------------------
 #
-# OFF BY DEFAULT, deliberately. This module's original design property was that
-# ingestion has no network dependency, so it can be re-run freely while
-# iterating without touching the budget. That property is worth keeping: with
+# OFF BY DEFAULT, deliberately. That property is worth keeping: with
 # the flag off, `python src/main.py ingest` is still free and unlimited. Only
 # an explicit opt-in spends anything.
 ENABLE_LLM_FALLBACK = os.getenv("CORTEX_INGEST_LLM_FALLBACK", "0") != "0"
