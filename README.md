@@ -47,6 +47,9 @@ python src/main.py ingest                      # -> data/normalized.jsonl
 
 `ingest` makes no network calls and costs nothing.
 
+<img width="5162" height="6198" alt="diagram (1)" src="https://github.com/user-attachments/assets/554ee96f-ae2a-4997-a6db-9b0fe7a11ea4" />
+
+
 ## Usage
 
 ```bash
