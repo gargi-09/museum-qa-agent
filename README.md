@@ -1,4 +1,4 @@
-# Cortex Take-Home: Museum Records QA
+# Museum Records QA
 
 Answers plain-language questions over ~5,000 museum records from the Cleveland
 Museum of Art and the Art Institute of Chicago, with provenance and
