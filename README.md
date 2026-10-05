@@ -49,6 +49,7 @@ python src/main.py ingest                      # -> data/normalized.jsonl
 
 ## Architecture
 [![Architecture diagram of gargi-09/museum-qa-agent](https://gitdiagram.com/gargi-09/museum-qa-agent/diagram.png)](https://gitdiagram.com/gargi-09/museum-qa-agent?utm_source=readme&utm_medium=picture)
+[![Architecture diagram of gargi-09/museum-qa-agent](https://gitdiagram.com/gargi-09/museum-qa-agent/diagram.png)](https://gitdiagram.com/gargi-09/museum-qa-agent?utm_source=readme&utm_medium=picture)
 
 <img width="5162" height="6198" alt="diagram (1)" src="https://github.com/user-attachments/assets/554ee96f-ae2a-4997-a6db-9b0fe7a11ea4" />
 
