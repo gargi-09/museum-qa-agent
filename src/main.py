@@ -157,7 +157,7 @@ DEMO_QUESTIONS = [
 def announce_budget(dev):
     """Always say which budget is about to be spent, before spending it."""
     if dev:
-        print("[main] dev_mode=True  -> X-Cortex-Mode: dev, free 50,000-token sandbox.")
+        print("[main] dev_mode=True  -> X-Mode: dev, free 50,000-token sandbox.")
     else:
         print("[main] dev_mode=False -> NO dev header. This draws on the REAL")
         print("       200,000-token submission budget. Use --dev while iterating.")
@@ -169,7 +169,7 @@ def cmd_ingest(args):
     out_path = args[1] if len(args) > 1 else DEFAULT_NORMALIZED
     if not os.path.exists(in_path):
         print(f"[main] Corpus not found at {in_path}")
-        print(f"[main] Fetch it first:  curl -O {{CORTEX_DATA_BASE}}/corpus/base.jsonl")
+        print(f"[main] Fetch it first:  curl -O {{DATA_BASE}}/corpus/base.jsonl")
         return 1
     ingest_main(in_path, out_path)
     return 0
@@ -291,7 +291,7 @@ def cmd_demo(args, dev):
         "# Demo transcript",
         "",
         f"Generated: {datetime.now(timezone.utc).isoformat()}",
-        f"Mode: {'dev sandbox (X-Cortex-Mode: dev)' if dev else 'REAL submission budget'}",
+        f"Mode: {'dev sandbox (X-Mode: dev)' if dev else 'REAL submission budget'}",
         f"Abstention threshold: {ABSTENTION_THRESHOLD}",
         "",
         # Counted, not hardcoded. This said "Four" while the set had five
