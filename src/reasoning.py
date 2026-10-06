@@ -23,7 +23,7 @@ the same 200k budget per the assignment doc) for a capability not yet
 shown to be needed. If a future question genuinely required visual
 information text doesn't capture (e.g. "which of these prints uses a
 red color palette"), the natural extension point is here: fetch the
-image via {CORTEX_DATA_BASE}/images/{image_path}, pass it as a vision
+image via {DATA_BASE}/images/{image_path}, pass it as a vision
 content part to Haiku alongside the text context already assembled.
 Not built now because it was never demonstrated to be necessary, and
 building it speculatively would spend budget on an unproven need.
@@ -314,12 +314,12 @@ Respond ONLY with valid JSON in this exact format, nothing else before or after:
 
 # The rules above, wrapped in an explicit delimiter.
 #
-# WHY THE TAGS EXIST: measurement showed the Cortex proxy DISCARDS the system
+# WHY THE TAGS EXIST: measurement showed the proxy DISCARDS the system
 # prompt however it is passed separately -- prompt_tokens did not move for a
 # top-level 'system' key, nor for a {"role": "system"} entry in messages, and
 # the model returned an identical generic greeting in both cases. The only
 # placement that provably survives is inside the user message itself
-# (CORTEX_MESSAGE_FORMAT=prepend, see api_client._prepend_system).
+# (MESSAGE_FORMAT=prepend, see api_client._prepend_system).
 #
 # That creates a problem the tags solve: once these rules sit in the same
 # message as the question and 5,000-ish characters of retrieved records, the
@@ -848,7 +848,7 @@ def answer_question(question, retriever, dev_mode=False, top_k=10,
             "error": haiku_result["error_type"],
             # The server's own error text, when there was one. On a 4xx this
             # names the offending field, which is what distinguishes a wrong
-            # CORTEX_MODEL from a wrong CORTEX_MESSAGE_FORMAT -- worth
+            # MODEL from a wrong MESSAGE_FORMAT -- worth
             # surfacing all the way up rather than only printing it.
             "error_detail": haiku_result.get("error_detail"),
             "answer": None,
@@ -913,10 +913,10 @@ def answer_question(question, retriever, dev_mode=False, top_k=10,
 if __name__ == "__main__":
     # dev_mode is now an EXPLICIT flag rather than hardcoded True, which it was
     # until now. The brief, §5: "While you're building, send the header
-    # X-Cortex-Mode: dev... Drop the header for the run you submit. We log
+    # X-Mode: dev... Drop the header for the run you submit. We log
     # both." With dev_mode hardcoded on, every run of this file -- including
     # one used to produce the submitted demo transcript -- drew on the 50k
-    # sandbox instead of the real budget. Since Cortex logs both, that would
+    # sandbox instead of the real budget. Since logs both, that would
     # have been visible on their side as a submission run that never really
     # ran. Defaults to OFF so the honest thing happens unless --dev is asked
     # for explicitly.
@@ -926,7 +926,7 @@ if __name__ == "__main__":
     if len(args) < 2:
         print('Usage: python reasoning.py [--dev] <normalized.jsonl> "<question>"')
         print()
-        print('  --dev   send X-Cortex-Mode: dev, drawing on the free 50,000-token')
+        print('  --dev   send X-Mode: dev, drawing on the free 50,000-token')
         print('          sandbox instead of the 200,000-token submission budget.')
         print('          Use this while building. OMIT it for the submitted run.')
         sys.exit(0)
@@ -938,7 +938,7 @@ if __name__ == "__main__":
     retriever = HybridRetriever(records)
 
     print(f"[reasoning] dev_mode={dev} -- "
-          + ("free 50k sandbox (X-Cortex-Mode: dev)" if dev
+          + ("free 50k sandbox (X-Mode: dev)" if dev
              else "REAL 200k submission budget, no dev header"))
 
     result = answer_question(question, retriever, dev_mode=dev)
