@@ -1,5 +1,7 @@
 """
-api_client.py -- All communication with the Cortex Haiku endpoint.
+MAKE SURE TO USE THE CORRECT ENV VARIABLE NAME BEFORE RUNNING!!
+
+api_client.py -- All communication with the endpoint.
 
 Nothing else in the pipeline should call requests.post() directly --
 every real network call goes through call_haiku() so token logging,
@@ -9,9 +11,9 @@ place.
 Optional .env overrides, all defaulted to match the brief
 
 The wire contract here mirrors the brief's documented client exactly:
-    POST {CORTEX_MODEL_ENDPOINT}
-    headers: Authorization: Bearer {CORTEX_API_KEY}
-             X-Cortex-Mode: dev        (only when dev_mode=True)
+    POST {MODEL_ENDPOINT}
+    headers: Authorization: Bearer {API_KEY}
+             X-Mode: dev        (only when dev_mode=True)
     json:    {"messages", "max_tokens", "temperature"}
     reply:   content, usage, budget_remaining, call_seq, model
 Status codes the brief calls out: 402 budget gone, 401 bad key, 5xx genuine
@@ -37,7 +39,7 @@ except ImportError:
           "before real API calls will work. check_credentials() still works without it.")
 
 
-REQUIRED_ENV_VARS = ["CORTEX_API_KEY", "CORTEX_MODEL_ENDPOINT", "CORTEX_DATA_BASE"]
+REQUIRED_ENV_VARS = ["API_KEY", "MODEL_ENDPOINT", "DATA_BASE"]
 
 MAX_RETRIES_5XX = 2
 RETRY_DELAY_5XX_SECONDS = 2
@@ -54,7 +56,7 @@ REQUEST_TIMEOUT_SECONDS = 180
 # checked, and a non-zero server-side default would make the same question
 # return a different answer -- and a different deterministic confidence score
 # -- on every run, so nothing could be reproduced or audited.
-TEMPERATURE = float(os.getenv("CORTEX_TEMPERATURE", "0.0"))
+TEMPERATURE = float(os.getenv("TEMPERATURE", "0.0"))
 
 
 # ---------------------------------------------------------------------------
@@ -72,7 +74,7 @@ TEMPERATURE = float(os.getenv("CORTEX_TEMPERATURE", "0.0"))
 #     "openai"    -> {"role": "system"} as the first messages entry
 #     "prepend"   -> folded into the first user message (see _prepend_system)
 #
-# LIVE MEASUREMENT against the Cortex proxy, using prompt_tokens as the test
+# LIVE MEASUREMENT against the proxy, using prompt_tokens as the test
 # for whether the text was billed as input at all:
 #
 #     bare "hi"                                prompt_tokens 8
@@ -82,7 +84,7 @@ TEMPERATURE = float(os.getenv("CORTEX_TEMPERATURE", "0.0"))
 # Neither separate placement is delivered. completion_tokens moved correctly
 # across those same calls (5 -> 16 -> 24), so the counter is responsive; and
 # the model returned the same generic greeting every time instead of obeying a
-# plain "reply with exactly CORTEX_OK" instruction. Two independent signals
+# plain "reply with exactly OK" instruction. Two independent signals
 # agreeing: this endpoint discards a separately-supplied system prompt.
 #
 # Hence "prepend" as the default. It is the placement of last resort and it is
@@ -96,15 +98,15 @@ TEMPERATURE = float(os.getenv("CORTEX_TEMPERATURE", "0.0"))
 # dangerous direction -- a silently dropped system prompt with no error at all
 # -- which is why call_haiku() carries the no-JSON canary, and why this was
 # probed instead of trusted.
-MESSAGE_FORMAT = os.getenv("CORTEX_MESSAGE_FORMAT", "prepend").lower()
+MESSAGE_FORMAT = os.getenv("MESSAGE_FORMAT", "prepend").lower()
 
 # The brief, §5: "There's no model to choose and no API key of your own to
 # buy." The documented payload carries no 'model' field, so do not send one by
 # default -- an undocumented extra field is at best ignored and at worst a 400.
-# Retained behind CORTEX_SEND_MODEL=1 only as an escape hatch if the live
+# Retained behind SEND_MODEL=1 only as an escape hatch if the live
 # endpoint turns out to want it after all.
-MODEL_NAME = os.getenv("CORTEX_MODEL", "claude-haiku-4-5-20251001")
-SEND_MODEL_FIELD = os.getenv("CORTEX_SEND_MODEL", "0") != "0"
+MODEL_NAME = os.getenv("MODEL", "claude-haiku-4-5-20251001")
+SEND_MODEL_FIELD = os.getenv("SEND_MODEL", "0") != "0"
 
 
 # ---------------------------------------------------------------------------
@@ -396,17 +398,6 @@ def estimate_tokens_preflight(text_or_messages, try_exact=False):
        sibling token-counting endpoint, modeled on Anthropic's own
        documented pattern (see
        https://platform.claude.com/docs/en/build-with-claude/token-counting).
-       LIKELY DOES NOT EXIST for this assignment specifically: the
-       assignment doc describes the setup as "an ordinary HTTP POST" to
-       ONE endpoint, and says the client is up to you -- but the
-       response shape is entirely up to the SERVER, not something a
-       client choice can create. This phrasing suggests Cortex built one
-       purpose-built route for this take-home, not a full mirror of
-       Anthropic's multi-endpoint API surface. This mode is kept in
-       anyway because it's fully safe either way (10s timeout, silent
-       fallback on any failure, never crashes, never costs real budget
-       tokens) -- but the realistic expectation is that it will always
-       fall through to the heuristic below for this specific assignment.
        DEFAULT (try_exact=False) is the one actually intended for use
        here; this parameter exists mainly for completeness/future reuse,
        not because it's expected to help on this task.
@@ -430,16 +421,16 @@ def estimate_tokens_preflight(text_or_messages, try_exact=False):
         return 0
 
     if try_exact and requests is not None and check_credentials():
-        endpoint = os.getenv("CORTEX_MODEL_ENDPOINT", "")
-        # Guess at the sibling counting endpoint by convention -- UNVERIFIED,
-        # Cortex may not expose this at all. Falls back silently either way.
+        endpoint = os.getenv("MODEL_ENDPOINT", "")
+        # Guess at the sibling counting endpoint by convention -- UNVERIFIED
+        #  Falls back silently either way.
         count_endpoint = endpoint.rstrip("/").rsplit("/", 1)[0] + "/count_tokens" \
             if endpoint else None
         if count_endpoint:
             try:
                 resp = requests.post(
                     count_endpoint,
-                    headers={"Authorization": f"Bearer {os.getenv('CORTEX_API_KEY')}",
+                    headers={"Authorization": f"Bearer {os.getenv('API_KEY')}",
                              "Content-Type": "application/json"},
                     json={"messages": text_or_messages if isinstance(text_or_messages, list)
                           else [{"role": "user", "content": text_or_messages}]},
@@ -601,7 +592,7 @@ def build_payload(messages, max_tokens, system=None, message_format=None,
         elif fmt == "prepend":
             payload["messages"] = _prepend_system(payload["messages"], system)
         else:
-            raise ValueError(f"Unknown CORTEX_MESSAGE_FORMAT {fmt!r} -- expected "
+            raise ValueError(f"Unknown MESSAGE_FORMAT {fmt!r} -- expected "
                              f"'anthropic', 'openai' or 'prepend'.")
 
     return payload
@@ -612,7 +603,7 @@ def _prepend_system(messages, system):
 
     The placement of last resort, for an endpoint that discards the system
     prompt however it is offered separately. Live measurement against the
-    Cortex proxy: prompt_tokens stayed at 8 for a bare "hi", for the same
+    proxy: prompt_tokens stayed at 8 for a bare "hi", for the same
     message plus a ~13-token top-level 'system' key, AND for the same message
     plus a {"role": "system"} entry in messages -- the text was never billed
     as input in either separate form, and the model's reply was an identical
@@ -661,7 +652,7 @@ def _prepend_system(messages, system):
 def call_haiku(messages, max_tokens=1024, dev_mode=False, stage="unspecified",
                 expect_json=False, system=None, temperature=None, _retry_count=0,
                 _prior_truncation=None):
-    """Makes a request to the Cortex Haiku endpoint.
+    """Makes a request to the Haiku endpoint.
 
     Returns a dict:
         content: str or None -- the model's response text
@@ -732,15 +723,15 @@ def call_haiku(messages, max_tokens=1024, dev_mode=False, stage="unspecified",
             "should_retry": False, "call_seq": None, "budget_remaining": None,
         }
 
-    endpoint = os.getenv("CORTEX_MODEL_ENDPOINT")
-    api_key = os.getenv("CORTEX_API_KEY")
+    endpoint = os.getenv("MODEL_ENDPOINT")
+    api_key = os.getenv("API_KEY")
 
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
     if dev_mode:
-        headers["X-Cortex-Mode"] = "dev"
+        headers["X-Mode"] = "dev"
 
     payload = build_payload(messages, max_tokens, system=system,
                              temperature=temperature)
@@ -844,7 +835,7 @@ def call_haiku(messages, max_tokens=1024, dev_mode=False, stage="unspecified",
             # did receive -- a prompt-engineering signal, not a config one.
             print(f"[api_client] WARNING: expect_json=True but the response contains "
                   f"no JSON at all. Placement is CONFIRMED working "
-                  f"(CORTEX_MESSAGE_FORMAT='prepend', measured by probe_schema.py), "
+                  f"(MESSAGE_FORMAT='prepend', measured by probe_schema.py), "
                   f"so the instructions almost certainly REACHED the model and it did "
                   f"not follow them. Do NOT re-probe the schema. The likely cause is "
                   f"that the JSON-schema rule is competing with ~2,200 tokens of "
@@ -852,7 +843,7 @@ def call_haiku(messages, max_tokens=1024, dev_mode=False, stage="unspecified",
                   f"boundary or restate the output contract at the end of the prompt.")
         else:
             print(f"[api_client] WARNING: expect_json=True but the response contains "
-                  f"no JSON at all. With CORTEX_MESSAGE_FORMAT={MESSAGE_FORMAT!r} the "
+                  f"no JSON at all. With MESSAGE_FORMAT={MESSAGE_FORMAT!r} the "
                   f"likely cause is that the instructions never reached the model at "
                   f"all -- both separate placements measured as DROPPED on this "
                   f"endpoint. Run probe_schema.py, or switch to 'prepend'.")
