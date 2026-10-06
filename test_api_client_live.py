@@ -62,7 +62,7 @@ def test_normal_request_echo():
         stage="live_test",
     )
     print(f"error_type: {result['error_type']}")
-    print(f"content (will be None/garbage -- httpbin doesn't know Cortex's schema): "
+    print(f"content (will be None/garbage -- httpbin doesn't know schema): "
           f"{result['content']!r}")
     # httpbin.org/post always returns 200, so we expect no error_type here --
     # this confirms the REQUEST went out and got a 200 back successfully.
