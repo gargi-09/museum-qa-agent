@@ -1,7 +1,9 @@
 """
+MAKE SURE TO USE THE CORRECT ENV VARIABLE NAME BEFORE RUNNING!!
+
 test_api_client_live.py -- Tests the REAL call_haiku() function from
 api_client.py against httpbin.org (a public echo/status-simulation
-service), WITHOUT ever touching real Cortex credentials or your actual
+service), WITHOUT ever touching real credentials or your actual
 .env file.
 
 HOW THIS STAYS SAFE:
@@ -17,9 +19,9 @@ HOW THIS STAYS SAFE:
 WHAT THIS TESTS: the actual network request/response handling in
 api_client.py's call_haiku() -- headers, payload shape, status-code
 classification, retry timing -- using httpbin.org as a stand-in server.
-It CANNOT test the real Cortex response schema (content shape, usage
+It CANNOT test the real response schema (content shape, usage
 field names, etc.) since httpbin.org just echoes/simulates status codes,
-it doesn't know anything about Cortex's actual response format.
+it doesn't know anything about actual response format.
 
 Usage: python test_api_client_live.py
 """
@@ -29,9 +31,9 @@ import sys
 # CRITICAL: set fake credentials BEFORE importing api_client, so
 # load_dotenv() (called on import) doesn't override them, and so we never
 # need to read/write the real .env file at all.
-os.environ["CORTEX_API_KEY"] = "test-fake-key-not-real"
-os.environ["CORTEX_MODEL_ENDPOINT"] = "https://httpbin.org/post"
-os.environ["CORTEX_DATA_BASE"] = "https://httpbin.org"
+os.environ["API_KEY"] = "test-fake-key-not-real"
+os.environ["MODEL_ENDPOINT"] = "https://httpbin.org/post"
+os.environ["DATA_BASE"] = "https://httpbin.org"
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "src"))
@@ -73,24 +75,24 @@ def test_402_budget_exhausted():
     print("=" * 70)
     print("TEST 3: Simulated 402 (budget exhausted) -- should stop immediately, no retry")
     print("=" * 70)
-    os.environ["CORTEX_MODEL_ENDPOINT"] = "https://httpbin.org/status/402"
+    os.environ["MODEL_ENDPOINT"] = "https://httpbin.org/status/402"
     result = call_haiku(messages=[{"role": "user", "content": "test"}], stage="live_test")
     print(f"error_type: {result['error_type']}")
     assert result['error_type'] == 'budget_exhausted'
     print("PASS -- 402 correctly classified, no retry attempted\n")
-    os.environ["CORTEX_MODEL_ENDPOINT"] = "https://httpbin.org/post"  # restore
+    os.environ["MODEL_ENDPOINT"] = "https://httpbin.org/post"  # restore
 
 
 def test_401_bad_key():
     print("=" * 70)
     print("TEST 4: Simulated 401 (bad key) -- should fail fast, no retry")
     print("=" * 70)
-    os.environ["CORTEX_MODEL_ENDPOINT"] = "https://httpbin.org/status/401"
+    os.environ["MODEL_ENDPOINT"] = "https://httpbin.org/status/401"
     result = call_haiku(messages=[{"role": "user", "content": "test"}], stage="live_test")
     print(f"error_type: {result['error_type']}")
     assert result['error_type'] == 'bad_key'
     print("PASS -- 401 correctly classified, no retry attempted\n")
-    os.environ["CORTEX_MODEL_ENDPOINT"] = "https://httpbin.org/post"
+    os.environ["MODEL_ENDPOINT"] = "https://httpbin.org/post"
 
 
 def test_500_retry_behavior():
@@ -99,7 +101,7 @@ def test_500_retry_behavior():
     print("=" * 70)
     print("(You should see 'failed -- retrying in 2s (1/2)...' etc. printed below, "
           "with real ~2s pauses between attempts)")
-    os.environ["CORTEX_MODEL_ENDPOINT"] = "https://httpbin.org/status/500"
+    os.environ["MODEL_ENDPOINT"] = "https://httpbin.org/status/500"
     import time
     start = time.time()
     result = call_haiku(messages=[{"role": "user", "content": "test"}], stage="live_test")
@@ -124,14 +126,14 @@ def test_500_retry_behavior():
     assert elapsed > 3.5, "Expected real delays between retries, elapsed time too short"
     print("PASS -- 500 triggered real retries with real delays, then handled "
           "the final outcome gracefully (whatever it was) without crashing\n")
-    os.environ["CORTEX_MODEL_ENDPOINT"] = "https://httpbin.org/post"
+    os.environ["MODEL_ENDPOINT"] = "https://httpbin.org/post"
 
 
 def cleanup():
     print("=" * 70)
     print("CLEANUP: removing fake credentials from this process's environment")
     print("=" * 70)
-    for var in ["CORTEX_API_KEY", "CORTEX_MODEL_ENDPOINT", "CORTEX_DATA_BASE"]:
+    for var in ["API_KEY", "MODEL_ENDPOINT", "DATA_BASE"]:
         os.environ.pop(var, None)
     print("Done. Your real .env file was never read or written by this script.")
 
