@@ -1,5 +1,7 @@
 # Museum Records QA
 
+*MAKE SURE TO USE THE CORRECT ENV & Database VARIABLE NAME BEFORE RUNNING!!*
+
 Answers plain-language questions over ~5,000 museum records from the Cleveland
 Museum of Art and the Art Institute of Chicago, with provenance and
 verification on every answer.
@@ -25,10 +27,10 @@ pip install -r requirements.txt
 `.env` in the repo root:
 
 ```
-CORTEX_API_KEY=...
-CORTEX_MODEL_ENDPOINT=...
-CORTEX_DATA_BASE=...
-CORTEX_MESSAGE_FORMAT=prepend
+API_KEY=...
+MODEL_ENDPOINT=...
+DATA_BASE=...
+MESSAGE_FORMAT=prepend
 ```
 
 `prepend` is required, not a preference: this endpoint silently discards a
@@ -41,7 +43,7 @@ header of [`src/api_client.py`](src/api_client.py).
 
 ```bash
 mkdir -p data
-curl -o data/base.jsonl "$CORTEX_DATA_BASE/corpus/base.jsonl"   # into data/
+curl -o data/base.jsonl "$DATA_BASE/corpus/base.jsonl"   # into data/
 python src/main.py ingest                      # -> data/normalized.jsonl
 ```
 
