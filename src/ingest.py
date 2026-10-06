@@ -1,5 +1,5 @@
 """
-ingest.py -- Loads and normalizes the CORTEX take-home museum corpus.
+ingest.py -- Loads and normalizes the museum corpus.
 
 Handles two source formats:
   - "structured": fields already separated, needs cleaning/normalization only
