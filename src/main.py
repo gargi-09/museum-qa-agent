@@ -1,18 +1,11 @@
 """
-main.py -- Single entry point for the Cortex take-home pipeline.
+main.py -- Single entry point for the pipeline.
 
 Subcommands:
     ingest                  normalize data/base.jsonl -> data/normalized.jsonl
     ask [--dev] "question"  answer one question, print the full result JSON
     demo [--dev]            run the demo question set end to end and write
                             src/demo/transcript.md
-
-DEV MODE, per the brief §5: "While you're building, send the header
-X-Cortex-Mode: dev... Drop the header for the run you submit. We log both."
-So --dev is OPT-IN everywhere here and defaults to OFF. Every command prints
-which budget it is about to draw on before spending anything, because the
-difference is a free 50,000-token sandbox versus the real 200,000-token
-submission budget and that is not a thing to get wrong silently.
 
 Usage:
     python src/main.py ingest
