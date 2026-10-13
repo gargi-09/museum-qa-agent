@@ -14,7 +14,6 @@ confidence score.
 
 - **Demo:** [`src/demo/transcript.md`](src/demo/transcript.md) — 10 questions
   run end to end on the real budget.
-- **Writeup:** Same directory - writeup.docx
 
 ## Setup
 
@@ -57,27 +56,45 @@ python src/main.py ingest                      # -> data/normalized.jsonl
 
 ## Usage
 
+Run single queries or the end-to-end evaluation suite via the CLI:
+
 ```bash
-python src/main.py ask --dev "What year was Coney Island Beach made?"
-python src/main.py demo --dev
+# Query the pipeline
+python src/main.py ask "What year was Coney Island Beach made?"
+
+# Run the end-to-end benchmark suite (10 sample questions)
+python src/main.py demo
 ```
 
-`--dev` uses the free 50,000-token sandbox. **Omitting it spends the real
-200,000-token budget** (`demo` costs ~29,000). Both commands print which budget
-they're about to draw on first.
+### Run against a mock/development environment without calling live endpoints
 
-Run from the repo root — data and cache paths are relative to the working
-directory. The first run computes embeddings (~4–5 min, 5,000 passages) and
-caches them to `cache/` behind a SHA-256 fingerprint of the passage text, so an
-ingest change invalidates the cache instead of reusing stale vectors.
+```bash
+python src/main.py ask --dev "What year was Coney Island Beach made?"
+Caching & Invalidation
+Run all commands from the repository root. On the first run, the pipeline generates dense embeddings for ~5,000 records (~4–5 min) and saves them to cache/ backed by a SHA-256 fingerprint of the passage text. If corpus ingestion changes, the fingerprint mismatches and automatically invalidates the cache instead of serving stale vectors.
 
-Corrections persist across runs and are applied before retrieval, entity
-resolution and contradiction detection:
+Curator Corrections & Stateful Overrides
+Explicit factual corrections persist across runs and are evaluated upstream—prior to retrieval, entity resolution, and contradiction checking:
+```
+
+### Add a manual correction for an ambiguous or disputed record
 
 ```bash
 python src/memory.py add cma-168184 year_raw 1999 "curator correction"
+```
+### Inspect current active overrides
+
+```bash
 python src/memory.py list
 ```
+Token Efficiency & Guardrails
+The reasoning engine enforces strict cost and latency constraints:
+
+Local Pre-filtering: Sparse/dense candidate fusion eliminates remote calls during the ranking stage.
+
+Single-Call Bounding: Generates verified answers in exactly one bounded model invocation per question.
+
+Deterministic Verification: Programmatic validation runs post-generation with zero additional token overhead.
 
 ## Layout
 
@@ -107,5 +124,3 @@ Two exceptions:
   monkeypatched. Five failure scenarios, zero tokens.
 - `probe_schema.py` — makes **real** dev-mode API calls, gated behind `--yes`.
   Resolved the wire format above.
-
-Total spend: **64,127 of 200,000 tokens** across 17 paid calls.
